@@ -24,5 +24,8 @@ dev = [
     "ruff",
 ]
 
+[project.scripts]
+evalkit = "evalkit.cli:app"
+
 [tool.setuptools.packages.find]
 include = ["evalkit*"]

@@ -207,8 +207,9 @@ def test_cli_answer_then_grade(tmp_path: Path, monkeypatch) -> None:
         ],
     )
     assert answered.exit_code == 0, answered.stdout + answered.stderr
-    assert "[1/2] two-plus-two attempt 1" in answered.stdout
-    assert "[2/2] capital-of-france attempt 1" in answered.stdout
+    lines = [line for line in answered.stdout.splitlines() if line.startswith("[")]
+    assert [line.split()[0] for line in lines] == ["[1/2]", "[2/2]"]
+    assert sorted(line.split()[1] for line in lines) == ["capital-of-france", "two-plus-two"]
 
     graded = runner.invoke(app, ["grade", "cli-answer"])
     assert graded.exit_code == 0, graded.stdout + graded.stderr

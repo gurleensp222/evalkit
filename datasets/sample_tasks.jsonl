@@ -1,0 +1,8 @@
+{"id": "exact-right", "category": "math", "prompt": "What is 2 + 2? Reply with digits only.", "scorer": "exact_match", "expected": "4"}
+{"id": "exact-wrong", "category": "knowledge", "prompt": "What is the capital of France? Reply with the city only.", "scorer": "exact_match", "expected": "Paris"}
+{"id": "contains-right", "category": "knowledge", "prompt": "Name the primary colors.", "scorer": "contains_all", "expected": ["red", "blue", "yellow"]}
+{"id": "contains-wrong", "category": "knowledge", "prompt": "Name the three closest planets to the sun.", "scorer": "contains_all", "expected": ["mercury", "venus", "earth"]}
+{"id": "json-right", "category": "format", "prompt": "Return a JSON object with keys name and city.", "scorer": "json_valid", "expected": {"required_keys": ["name", "city"]}}
+{"id": "json-wrong", "category": "format", "prompt": "Return a JSON object with keys a and b.", "scorer": "json_valid", "expected": {"required_keys": ["a", "b"]}}
+{"id": "python-right", "category": "code", "prompt": "Write a Python function add(a, b) that returns the sum.", "scorer": "python_unit_tests", "expected": "assert add(1, 2) == 3\nassert add(-1, 1) == 0"}
+{"id": "python-wrong", "category": "code", "prompt": "Write a Python function add(a, b) that returns the sum of its arguments.", "scorer": "python_unit_tests", "expected": "assert add(1, 2) == 3"}

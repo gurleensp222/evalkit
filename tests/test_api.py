@@ -1,6 +1,8 @@
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from evalkit.api import create_app
@@ -274,11 +276,345 @@ def test_openapi_names_the_response_models(client: TestClient) -> None:
     assert {
         "/health",
         "/tasks",
+        "/rubrics",
+        "/rubrics/{rubric_id}",
+        "/rubrics/{rubric_id}/versions",
+        "/prompts",
         "/runs",
         "/runs/{run_id}",
         "/runs/{run_id}/grade",
         "/runs/{run_id}/failures",
+        "/runs/{run_id}/criteria",
         "/compare",
     } <= set(body["paths"])
     names = set(body["components"]["schemas"])
-    assert {"RunCreate", "RunDetail", "CompareResponse", "FailureOut"} <= names
+    assert {
+        "RunCreate",
+        "RunDetail",
+        "CompareResponse",
+        "FailureOut",
+        "RubricCreated",
+        "CriterionRate",
+        "Task",
+        "Rubric",
+    } <= names
+
+
+def _rubric_body(description: str, *, implicit: bool) -> dict[str, object]:
+    criteria: list[dict[str, object]] = [
+        {
+            "id": "answers",
+            "weight": 0.6 if implicit else 1.0,
+            "description": description,
+            "necessity": "explicit",
+            "kind": "subjective",
+            "example": "It states the refund window.",
+        }
+    ]
+    if implicit:
+        criteria.append(
+            {
+                "id": "no_password",
+                "weight": 0.4,
+                "description": "The reply never asks for a password.",
+                "necessity": "implicit",
+                "kind": "objective",
+                "critical": True,
+                "answer_key": "Fails if the reply asks for a password.",
+            }
+        )
+    return {
+        "id": "demo",
+        "version": 1,
+        "description": "Support replies.",
+        "pass_threshold": 0.5,
+        "criteria": criteria,
+    }
+
+
+def test_rubric_posts_keep_each_version_and_return_lint_warnings(client: TestClient) -> None:
+    first = client.post(
+        "/rubrics",
+        json=_rubric_body("The reply answers the question.", implicit=False),
+    )
+    assert first.status_code == 201
+    stored = first.json()
+    assert stored["rubric"]["version"] == 1
+    assert stored["warnings"] == ["demo: rubric has no implicit criteria"]
+
+    invalid = client.post(
+        "/rubrics",
+        json=_rubric_body("The reply answers the question.", implicit=False) | {"pass_threshold": 2},
+    )
+    assert invalid.status_code == 422
+
+    second = client.post(
+        "/rubrics",
+        json=_rubric_body("The reply states the refund window.", implicit=True),
+    )
+    assert second.status_code == 201
+    assert second.json()["rubric"]["version"] == 2
+    assert second.json()["warnings"] == []
+
+    latest = client.get("/rubrics/demo")
+    assert latest.status_code == 200
+    assert latest.json()["version"] == 2
+    assert latest.json()["criteria"][0]["description"] == "The reply states the refund window."
+
+    versions = client.get("/rubrics/demo/versions")
+    assert versions.status_code == 200
+    body = versions.json()
+    assert [item["version"] for item in body] == [1, 2]
+    assert body[0]["criteria"][0]["description"] == "The reply answers the question."
+    assert body[0]["criteria"][0]["weight"] == 1.0
+
+    missing = client.get("/rubrics/missing")
+    assert missing.status_code == 404
+    assert client.get("/rubrics/missing/versions").status_code == 404
+
+
+def test_prompts_reject_an_unknown_rubric_and_list_saved_prompts(client: TestClient) -> None:
+    unknown = client.post(
+        "/prompts",
+        json={
+            "id": "refund",
+            "category": "support",
+            "prompt": "How long is the refund window?",
+            "rubric_id": "demo",
+        },
+    )
+    assert unknown.status_code == 400
+    assert "unknown rubric_id" in unknown.json()["detail"]
+
+    client.post("/rubrics", json=_rubric_body("The reply answers the question.", implicit=True))
+    saved = client.post(
+        "/prompts",
+        json={
+            "id": "refund",
+            "category": "support",
+            "prompt": "How long is the refund window?",
+            "rubric_id": "demo",
+        },
+    )
+    assert saved.status_code == 201
+    assert saved.json()["rubric_id"] == "demo"
+
+    scored = client.post(
+        "/prompts",
+        json={
+            "id": "two-plus-two",
+            "category": "math",
+            "prompt": "2+2",
+            "scorer": "exact_match",
+            "expected": "4",
+        },
+    )
+    assert scored.status_code == 201
+
+    replaced = client.post(
+        "/prompts",
+        json={
+            "id": "refund",
+            "category": "support",
+            "prompt": "What is the refund window?",
+            "rubric_id": "demo",
+        },
+    )
+    assert replaced.status_code == 201
+
+    listed = client.get("/prompts")
+    assert listed.status_code == 200
+    by_id = {item["id"]: item for item in listed.json()}
+    assert set(by_id) == {"refund", "two-plus-two"}
+    assert by_id["refund"]["prompt"] == "What is the refund window?"
+
+
+def test_run_can_use_prompts_stored_in_sqlite(client: TestClient) -> None:
+    empty = client.post("/runs", json={"provider": "mock", "dataset": "sqlite", "attempts": 1})
+    assert empty.status_code == 400
+    assert empty.json()["detail"] == "no prompts stored"
+
+    client.post(
+        "/prompts",
+        json={
+            "id": "two-plus-two",
+            "category": "math",
+            "prompt": "2+2",
+            "scorer": "exact_match",
+            "expected": "4",
+        },
+    )
+    created = client.post("/runs", json={"provider": "mock", "dataset": "sqlite", "attempts": 1})
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+    detail = client.get(f"/runs/{run_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "graded"
+    assert detail.json()["summary"][0]["pass_rate"] == 1.0
+
+    rates = client.get(f"/runs/{run_id}/criteria")
+    assert rates.status_code == 200
+    assert rates.json() == []
+    missing = client.get("/runs/missing/criteria")
+    assert missing.status_code == 404
+
+
+def test_criterion_rates_use_sqlite_and_file_sources(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.post("/rubrics", json=_rubric_body("The reply answers the question.", implicit=True))
+    client.post(
+        "/prompts",
+        json={
+            "id": "stored-task",
+            "category": "support",
+            "prompt": "How long is the refund window?",
+            "rubric_id": "demo",
+        },
+    )
+    dataset = tmp_path / "file_prompts.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "file-task",
+                "category": "support",
+                "prompt": "Where do I send the return?",
+                "rubric_id": "demo",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class Judge:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.name = "judge"
+
+        def generate(self, prompt: str, **kwargs: object) -> str:
+            del kwargs
+            self.calls += 1
+            return json.dumps(
+                {
+                    "criteria": [
+                        {"id": "answers", "met": True, "reason": "yes"},
+                        {"id": "no_password", "met": self.calls % 2 == 1, "reason": "checked"},
+                    ]
+                }
+            )
+
+    monkeypatch.setattr("evalkit.api.create_judge_provider", lambda *args, **kwargs: Judge())
+    stored = client.post(
+        "/runs",
+        json={
+            "provider": "mock",
+            "dataset": "sqlite",
+            "attempts": 2,
+            "judge_provider": "mock",
+        },
+    )
+    assert stored.status_code == 202
+    stored_id = stored.json()["run_id"]
+    stored_rates = client.get(f"/runs/{stored_id}/criteria")
+    assert stored_rates.status_code == 200
+    assert {(row["criterion_id"], row["model"], row["met_rate"]) for row in stored_rates.json()} == {
+        ("answers", "mock", 1.0),
+        ("no_password", "mock", 0.5),
+    }
+
+    filed = client.post(
+        "/runs",
+        json={
+            "provider": "mock",
+            "dataset": str(dataset),
+            "attempts": 1,
+            "judge_provider": "mock",
+        },
+    )
+    assert filed.status_code == 202
+    filed_id = filed.json()["run_id"]
+    filed_detail = client.get(f"/runs/{filed_id}")
+    assert filed_detail.json()["status"] == "graded"
+    filed_rates = client.get(f"/runs/{filed_id}/criteria")
+    assert filed_rates.status_code == 200
+    assert {row["criterion_id"] for row in filed_rates.json()} == {"answers", "no_password"}
+
+
+def test_sqlite_prompt_can_use_a_file_rubric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rubrics = tmp_path / "rubrics"
+    rubrics.mkdir()
+    (rubrics / "filedemo.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "filedemo",
+                "version": 1,
+                "description": "A short reply.",
+                "pass_threshold": 0.5,
+                "criteria": [
+                    {
+                        "id": "clear",
+                        "weight": 1.0,
+                        "necessity": "explicit",
+                        "kind": "subjective",
+                        "description": "The reply is clear.",
+                        "example": "It answers in one sentence.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(
+        create_app(
+            runs_directory=tmp_path / "runs",
+            default_dataset=tmp_path / "unused.jsonl",
+            rubrics_directory=rubrics,
+        )
+    )
+    missing = client.post(
+        "/prompts",
+        json={
+            "id": "ask",
+            "category": "support",
+            "prompt": "Say hello.",
+            "rubric_id": "not-a-rubric",
+        },
+    )
+    assert missing.status_code == 400
+
+    saved = client.post(
+        "/prompts",
+        json={
+            "id": "ask",
+            "category": "support",
+            "prompt": "Say hello.",
+            "rubric_id": "filedemo",
+        },
+    )
+    assert saved.status_code == 201
+
+    class Judge:
+        name = "judge"
+
+        def generate(self, prompt: str, **kwargs: object) -> str:
+            del prompt, kwargs
+            return json.dumps({"criteria": [{"id": "clear", "met": True, "reason": "yes"}]})
+
+    monkeypatch.setattr("evalkit.api.create_judge_provider", lambda *args, **kwargs: Judge())
+    created = client.post(
+        "/runs",
+        json={"provider": "mock", "dataset": "sqlite", "attempts": 1, "judge_provider": "mock"},
+    )
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+    detail = client.get(f"/runs/{run_id}")
+    assert detail.json()["status"] == "graded"
+    assert detail.json()["summary"][0]["pass_rate"] == 1.0
+    rates = client.get(f"/runs/{run_id}/criteria")
+    assert rates.json() == [{"criterion_id": "clear", "model": "mock", "met_rate": 1.0}]
+

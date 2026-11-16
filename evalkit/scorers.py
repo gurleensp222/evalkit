@@ -9,6 +9,8 @@ Each scorer takes ``(output, expected)`` and returns a ``ScoreResult``.
 - ``python_unit_tests``: test source, a list of test lines, or ``{"tests": ...}``
 - ``llm_judge``: a rubric string, or ``{"rubric": "..."}``. The runner also
   passes the task prompt and a judge provider.
+- ``no_fabricated_links``: the task's ``allowed_urls`` list. An empty list
+  allows no links. The runner passes that list, not ``expected``.
 """
 
 from __future__ import annotations
@@ -38,6 +40,9 @@ _PYTHON_FENCE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n?(.*?)```", re.DOTALL)
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+_BARE_URL_RE = re.compile(r"https?://[^\s<>\[\]()]+", re.IGNORECASE)
+_URL_TRAILING = ".,;:!?\"'`>"
 
 Scorer = Callable[[str, Any], ScoreResult]
 
@@ -352,10 +357,53 @@ def llm_judge(output: str, expected: Any, *, prompt: str, judge: Provider) -> Sc
     return ScoreResult(score=(score - 1) / 4, passed=score >= 3, reason=reason)
 
 
+def extract_urls(text: str) -> list[str]:
+    """Return http and https URLs, including the target of a markdown link."""
+    if not isinstance(text, str) or not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        url = raw.rstrip(_URL_TRAILING)
+        if url and url not in seen:
+            seen.add(url)
+            found.append(url)
+
+    for match in _MARKDOWN_LINK_RE.finditer(text):
+        add(match.group(1))
+    without_markdown = _MARKDOWN_LINK_RE.sub(" ", text)
+    for match in _BARE_URL_RE.finditer(without_markdown):
+        add(match.group(0))
+    return found
+
+
+def no_fabricated_links(output: str, allowed_urls: Any) -> ScoreResult:
+    """Fail when the answer contains an http(s) URL that is not allowed.
+
+    ``allowed_urls`` is a list. An empty list allows no links. An answer with
+    no links passes.
+    """
+    if not isinstance(output, str):
+        return _failed("no_fabricated_links requires string output")
+    if allowed_urls is None:
+        allowed: set[str] = set()
+    elif isinstance(allowed_urls, list) and all(isinstance(item, str) for item in allowed_urls):
+        allowed = set(allowed_urls)
+    else:
+        return _failed("no_fabricated_links requires a list of URLs")
+    invented = [url for url in extract_urls(output) if url not in allowed]
+    if invented:
+        listed = ", ".join(invented)
+        return _failed(f"fabricated link: {listed}")
+    return _passed("no fabricated links")
+
+
 SCORERS: dict[str, Scorer] = {
     "exact_match": exact_match,
     "contains_all": contains_all,
     "json_valid": json_valid,
     "python_unit_tests": python_unit_tests,
     "llm_judge": llm_judge,
+    "no_fabricated_links": no_fabricated_links,
 }

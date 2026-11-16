@@ -6,7 +6,7 @@ import hashlib
 import itertools
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -151,6 +151,9 @@ class Criterion(BaseModel):
         return self
 
 
+Task.model_rebuild(_types_namespace={"Criterion": Criterion})
+
+
 class Rubric(BaseModel):
     """A versioned set of criteria a judge can apply."""
 
@@ -217,15 +220,56 @@ def lint_rubrics(rubrics: Mapping[str, Rubric]) -> list[str]:
     warnings: list[str] = []
     for rubric in rubrics.values():
         for criterion in rubric.criteria:
-            if _holds_two_requirements(criterion.description):
-                warnings.append(_warning(rubric.id, criterion.id, _TWO_REQUIREMENTS))
-            if _grader_cannot_see(criterion):
-                warnings.append(_warning(rubric.id, criterion.id, _UNSEEN_FACT))
-            if _is_generic(criterion):
-                warnings.append(_warning(rubric.id, criterion.id, _GENERIC_CRITERION))
+            warnings.extend(_criterion_warnings(rubric.id, criterion))
         if not any(criterion.necessity == "implicit" for criterion in rubric.criteria):
             warnings.append(_warning(rubric.id, None, _NO_IMPLICIT))
     return warnings
+
+
+def lint_extra_criteria(tasks: Sequence[Task]) -> list[str]:
+    """Warn about extra criteria on prompts, using the same rules as a rubric."""
+    warnings: list[str] = []
+    for task in tasks:
+        for criterion in task.extra_criteria:
+            warnings.extend(_criterion_warnings(task.id, criterion))
+    return warnings
+
+
+def merge_rubric(rubric: Rubric, extra: Sequence[Criterion]) -> Rubric:
+    """Add extra criteria and rescale every weight so the set sums to 1.
+
+    Rubric weights keep their ratios. Extra criteria keep the weights they were
+    given, relative to that same total. An empty extra list returns ``rubric``.
+    """
+    if not extra:
+        return rubric
+    combined = [*rubric.criteria, *extra]
+    seen: list[str] = []
+    duplicates: list[str] = []
+    for criterion in combined:
+        if criterion.id in seen and criterion.id not in duplicates:
+            duplicates.append(criterion.id)
+        seen.append(criterion.id)
+    if duplicates:
+        raise ValueError(f"duplicate criterion ids: {', '.join(duplicates)}")
+    total = sum(criterion.weight for criterion in combined)
+    scaled = [criterion.weight / total for criterion in combined]
+    scaled[-1] = 1.0 - sum(scaled[:-1])
+    merged = [
+        criterion.model_copy(update={"weight": weight})
+        for criterion, weight in zip(combined, scaled, strict=True)
+    ]
+    return rubric.model_copy(update={"criteria": merged})
+
+
+def applied_rubric(task: Task, rubrics: Mapping[str, Rubric]) -> Rubric | None:
+    """Return the rubric a task grades against, including its extra criteria."""
+    if not task.rubric_id:
+        return None
+    rubric = rubrics.get(task.rubric_id)
+    if rubric is None:
+        return None
+    return merge_rubric(rubric, task.extra_criteria)
 
 
 def load_rubrics(directory: str | Path) -> dict[str, Rubric]:
@@ -278,6 +322,7 @@ def load_prompts(path: str | Path, rubrics: Mapping[str, Rubric]) -> list[Task]:
     missing = [task.id for task in tasks if task.rubric_id and task.rubric_id not in rubrics]
     if missing:
         problems.append("unknown rubric_id for prompt ids: " + ", ".join(missing))
+    problems.extend(_merge_problems(tasks, rubrics))
     if problems:
         raise ValueError("\n".join(problems))
     return tasks
@@ -285,6 +330,29 @@ def load_prompts(path: str | Path, rubrics: Mapping[str, Rubric]) -> list[Task]:
 
 def _present(value: str | None) -> bool:
     return value is not None and bool(value.strip())
+
+
+def _merge_problems(tasks: Sequence[Task], rubrics: Mapping[str, Rubric]) -> list[str]:
+    problems: list[str] = []
+    for task in tasks:
+        if not task.extra_criteria or not task.rubric_id or task.rubric_id not in rubrics:
+            continue
+        try:
+            merge_rubric(rubrics[task.rubric_id], task.extra_criteria)
+        except ValueError as exc:
+            problems.append(f"{task.id}: {exc}")
+    return problems
+
+
+def _criterion_warnings(owner_id: str, criterion: Criterion) -> list[str]:
+    warnings: list[str] = []
+    if _holds_two_requirements(criterion.description):
+        warnings.append(_warning(owner_id, criterion.id, _TWO_REQUIREMENTS))
+    if _grader_cannot_see(criterion):
+        warnings.append(_warning(owner_id, criterion.id, _UNSEEN_FACT))
+    if _is_generic(criterion):
+        warnings.append(_warning(owner_id, criterion.id, _GENERIC_CRITERION))
+    return warnings
 
 
 def _warning(rubric_id: str, criterion_id: str | None, message: str) -> str:

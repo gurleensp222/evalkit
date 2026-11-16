@@ -1,12 +1,19 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from evalkit.rubrics import Criterion
 
 
 class Task(BaseModel):
     """One item in an evaluation dataset.
 
     Set ``scorer`` for a built-in check, or ``rubric_id`` for a judge rubric.
+    ``extra_criteria`` are added to that rubric. ``deterministic_checks`` run
+    before the judge. ``allowed_urls`` is the list ``no_fabricated_links`` allows.
     """
 
     id: str
@@ -15,9 +22,12 @@ class Task(BaseModel):
     scorer: str | None = None
     rubric_id: str | None = None
     expected: Any = None
+    extra_criteria: list[Criterion] = Field(default_factory=list)
+    allowed_urls: list[str] = Field(default_factory=list)
+    deterministic_checks: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def exactly_one_grader(self) -> "Task":
+    def exactly_one_grader(self) -> Task:
         has_scorer = isinstance(self.scorer, str) and bool(self.scorer.strip())
         has_rubric = isinstance(self.rubric_id, str) and bool(self.rubric_id.strip())
         if has_scorer == has_rubric:
@@ -29,6 +39,23 @@ class Task(BaseModel):
             assert self.rubric_id is not None
             self.rubric_id = self.rubric_id.strip()
             self.scorer = None
+        if self.extra_criteria:
+            from evalkit.rubrics import Criterion
+
+            parsed: list[Any] = []
+            for item in self.extra_criteria:
+                if isinstance(item, Criterion):
+                    parsed.append(item)
+                else:
+                    parsed.append(Criterion.model_validate(item))
+            self.extra_criteria = parsed
+        if self.extra_criteria and not has_rubric:
+            raise ValueError("extra_criteria require rubric_id")
+        if self.deterministic_checks and not has_rubric:
+            raise ValueError("deterministic_checks require rubric_id")
+        unknown = [name for name in self.deterministic_checks if name != "no_fabricated_links"]
+        if unknown:
+            raise ValueError("unknown deterministic check: " + ", ".join(unknown))
         return self
 
 

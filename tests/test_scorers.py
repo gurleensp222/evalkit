@@ -8,6 +8,7 @@ from evalkit.scorers import (
     exact_match,
     json_valid,
     llm_judge,
+    no_fabricated_links,
     python_unit_tests,
 )
 
@@ -64,12 +65,14 @@ def test_scorers_are_registered_by_name() -> None:
         "json_valid",
         "python_unit_tests",
         "llm_judge",
+        "no_fabricated_links",
     }
     assert SCORERS["exact_match"] is exact_match
     assert SCORERS["contains_all"] is contains_all
     assert SCORERS["json_valid"] is json_valid
     assert SCORERS["python_unit_tests"] is python_unit_tests
     assert SCORERS["llm_judge"] is llm_judge
+    assert SCORERS["no_fabricated_links"] is no_fabricated_links
 
 
 @pytest.mark.parametrize(
@@ -429,3 +432,23 @@ def test_llm_judge_reports_a_judge_failure() -> None:
     result = llm_judge("4", "digits", prompt="Q", judge=_Judge(RuntimeError("offline")))
     assert_failed(result)
     assert result.reason == "judge failed: offline"
+
+
+def test_no_fabricated_links_checks_bare_and_markdown_urls() -> None:
+    assert_passed(no_fabricated_links("No address here.", []))
+    assert_passed(no_fabricated_links("See https://example.com/docs", ["https://example.com/docs"]))
+    invented = no_fabricated_links("See https://evil.example/phish", ["https://example.com/docs"])
+    assert_failed(invented)
+    assert "https://evil.example/phish" in invented.reason
+    markdown = no_fabricated_links(
+        "Read the [guide](https://example.com/docs) today.",
+        [],
+    )
+    assert_failed(markdown)
+    assert "https://example.com/docs" in markdown.reason
+    assert_passed(
+        no_fabricated_links(
+            "Read the [guide](https://example.com/docs) today.",
+            ["https://example.com/docs"],
+        )
+    )

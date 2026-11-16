@@ -16,16 +16,27 @@ from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from evalkit.analysis import by_category, compare, failures, load_runs, summary
+from evalkit.models import Task, TaskResult
 from evalkit.pipeline import answer_run, grade_run
 from evalkit.providers import ProviderError, create_judge_provider, create_provider
-from evalkit.rubrics import Rubric, load_prompts, load_rubrics
+from evalkit.rubrics import Rubric, lint_rubrics, load_prompts, load_rubrics
 from evalkit.runner import ensure_model_available
 from evalkit.storage import (
     DEFAULT_RUNS_DIR,
+    SQLITE_DATASET,
+    StoredCriterionGrade,
     StoredRun,
+    list_rubric_versions,
     list_run_ids,
+    load_criterion_grades,
+    load_latest_rubrics,
+    load_results,
+    load_rubric,
     load_run,
+    load_stored_prompts,
     run_progress,
+    save_prompt,
+    save_rubric,
     upsert_run,
 )
 
@@ -64,7 +75,7 @@ class RunCreate(BaseModel):
     provider: str = Field(examples=["mock"], description="mock, ollama, openai, or anthropic.")
     dataset: str = Field(
         examples=["datasets/sample_tasks.jsonl"],
-        description="Path to a JSONL task file.",
+        description="Path to a JSONL task file, or 'sqlite' for prompts stored by POST /prompts.",
     )
     model: str | None = Field(
         default=None,
@@ -178,6 +189,21 @@ class CompareResponse(BaseModel):
     excludes_zero: bool = Field(description="True when the 95% interval does not contain 0.")
 
 
+class RubricCreated(BaseModel):
+    """A rubric that was stored, plus lint warnings that do not block the save."""
+
+    rubric: Rubric
+    warnings: list[str]
+
+
+class CriterionRate(BaseModel):
+    """Share of attempts in which one criterion was met for one answer model."""
+
+    criterion_id: str
+    model: str
+    met_rate: float = Field(ge=0, le=1)
+
+
 @dataclass
 class _RunState:
     run_id: str
@@ -230,15 +256,73 @@ def list_tasks(
     return [TaskOut.model_validate(task.model_dump()) for task in tasks]
 
 
+@router.post("/rubrics", response_model=RubricCreated, status_code=201)
+def create_rubric(body: Rubric, request: Request) -> RubricCreated:
+    """Store a new rubric version and return lint warnings.
+
+    Each post appends the next version. Older versions stay available.
+    """
+    stored = save_rubric(body, directory=_runs_directory(request))
+    return RubricCreated(rubric=stored, warnings=lint_rubrics({stored.id: stored}))
+
+
+@router.get(
+    "/rubrics/{rubric_id}/versions",
+    response_model=list[Rubric],
+    responses={404: {"description": "Unknown rubric"}},
+)
+def list_versions(rubric_id: str, request: Request) -> list[Rubric]:
+    """List every stored version of a rubric, oldest first."""
+    versions = list_rubric_versions(rubric_id, directory=_runs_directory(request))
+    if not versions:
+        raise HTTPException(status_code=404, detail=f"unknown rubric: {rubric_id}")
+    return versions
+
+
+@router.get(
+    "/rubrics/{rubric_id}",
+    response_model=Rubric,
+    responses={404: {"description": "Unknown rubric"}},
+)
+def get_rubric(rubric_id: str, request: Request) -> Rubric:
+    """Return the latest stored version of a rubric."""
+    stored = load_rubric(rubric_id, directory=_runs_directory(request))
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"unknown rubric: {rubric_id}")
+    return stored
+
+
+@router.post("/prompts", response_model=Task, status_code=201)
+def create_prompt(body: Task, request: Request) -> Task:
+    """Store a prompt. A rubric id must already exist in SQLite or in the rubric files."""
+    if body.rubric_id and body.rubric_id not in _rubric_catalog(request):
+        raise HTTPException(status_code=400, detail=f"unknown rubric_id: {body.rubric_id}")
+    return save_prompt(body, directory=_runs_directory(request))
+
+
+@router.get("/prompts", response_model=list[Task])
+def list_prompts(request: Request) -> list[Task]:
+    """List prompts stored by POST /prompts."""
+    return load_stored_prompts(_runs_directory(request))
+
+
 @router.post("/runs", response_model=RunCreated, status_code=202)
 def start_run(body: RunCreate, request: Request, background: BackgroundTasks) -> RunCreated:
     """Start an evaluation in the background and return its run id."""
-    dataset = Path(body.dataset)
-    if not dataset.exists():
-        raise HTTPException(status_code=404, detail=f"dataset not found: {dataset}")
+    directory = _runs_directory(request)
+    dataset_value = body.dataset.strip()
     try:
         catalog = _rubric_catalog(request)
-        load_prompts(dataset, catalog)
+        if dataset_value == SQLITE_DATASET:
+            tasks = load_stored_prompts(directory, catalog)
+            if not tasks:
+                raise HTTPException(status_code=400, detail="no prompts stored")
+            dataset: str | Path = SQLITE_DATASET
+        else:
+            dataset = Path(dataset_value)
+            if not dataset.exists():
+                raise HTTPException(status_code=404, detail=f"dataset not found: {dataset}")
+            load_prompts(dataset, catalog)
         ensure_model_available(
             create_provider(body.provider, model=body.model, temperature=body.temperature)
         )
@@ -368,6 +452,23 @@ def get_failures(run_id: str, request: Request) -> list[FailureOut]:
     return [FailureOut.model_validate(row.to_dict()) for _, row in rows.iterrows()]
 
 
+@router.get(
+    "/runs/{run_id}/criteria",
+    response_model=list[CriterionRate],
+    responses={404: {"description": "Unknown run"}},
+)
+def get_criteria(run_id: str, request: Request) -> list[CriterionRate]:
+    """Return the met rate of each criterion for each answer model."""
+    directory = _runs_directory(request)
+    _stored_or_http(run_id, directory)
+    results = load_results(run_id, directory=directory)
+    if not results:
+        return []
+    judge = results[0].judge or ""
+    grades = load_criterion_grades(run_id, directory=directory, judge=judge)
+    return _criterion_rates(results, grades)
+
+
 @router.get("/compare", response_model=CompareResponse, responses={404: {"description": "Unknown run"}})
 def compare_runs(
     request: Request,
@@ -393,7 +494,7 @@ def _execute_run(
     app: FastAPI,
     run_id: str,
     provider_name: str,
-    dataset: Path,
+    dataset: str | Path,
     *,
     model: str | None = None,
     temperature: float | None = None,
@@ -459,10 +560,21 @@ def _rubric_catalog(request: Request) -> dict[str, Rubric]:
 
 
 def _rubric_catalog_from_app(app: FastAPI) -> dict[str, Rubric]:
+    """File rubrics, with a stored rubric of the same id taking the latest version."""
+    catalog: dict[str, Rubric] = {}
     directory = Path(app.state.rubrics_directory)
-    if not directory.is_dir():
-        return {}
-    return load_rubrics(directory)
+    if directory.is_dir():
+        catalog.update(load_rubrics(directory))
+    catalog.update(load_latest_rubrics(directory=_runs_directory_from(app)))
+    return catalog
+
+
+def _runs_directory(request: Request) -> Path:
+    return _runs_directory_from(request.app)
+
+
+def _runs_directory_from(app: FastAPI) -> Path:
+    return Path(app.state.runs_directory)
 
 
 def _dataset_path(request: Request, dataset: str | None) -> Path:
@@ -587,6 +699,33 @@ def _info(state: _RunState) -> RunInfo:
         dataset=state.dataset or None,
         error=state.error,
     )
+
+
+def _criterion_rates(
+    results: list[TaskResult],
+    grades: list[StoredCriterionGrade],
+) -> list[CriterionRate]:
+    model_of = {(result.task_id, result.attempt): result.model for result in results}
+    grouped: dict[tuple[str, str], list[bool]] = {}
+    order: list[tuple[str, str]] = []
+    for grade in grades:
+        key = (grade.criterion_id, model_of.get((grade.task_id, grade.attempt), ""))
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(grade.met)
+    rates: list[CriterionRate] = []
+    for criterion_id, model in order:
+        flags = grouped[(criterion_id, model)]
+        met = sum(1.0 for flag in flags if flag) / len(flags)
+        rates.append(
+            CriterionRate(
+                criterion_id=criterion_id,
+                model=model,
+                met_rate=min(1.0, max(0.0, round(met, 6))),
+            )
+        )
+    return rates
 
 
 app = create_app()

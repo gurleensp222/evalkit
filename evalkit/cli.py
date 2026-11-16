@@ -13,12 +13,20 @@ from evalkit.agents import load_agents, resolve_agents
 from evalkit.models import TaskResult
 from evalkit.pipeline import answer_run, grade_run
 from evalkit.providers import ProviderError, create_judge_provider, create_provider
-from evalkit.rubrics import Rubric, lint_rubrics, load_rubrics
+from evalkit.rubrics import (
+    Rubric,
+    lint_extra_criteria,
+    lint_rubrics,
+    load_prompts,
+    load_rubrics,
+)
 from evalkit.storage import (
     DATABASE_NAME,
     DEFAULT_RUNS_DIR,
+    SQLITE_DATASET,
     StoredCriterionGrade,
     load_criterion_grades,
+    load_latest_rubrics,
     load_results,
     load_run,
 )
@@ -170,7 +178,7 @@ def run(
     grader_context: str = GRADER_CONTEXT_OPTION,
 ) -> None:
     """Answer every task, then grade the saved answers."""
-    if not dataset.exists():
+    if str(dataset) != SQLITE_DATASET and not dataset.exists():
         typer.echo(f"dataset not found: {dataset}", err=True)
         raise typer.Exit(1)
     chosen_id = run_id or _new_run_id()
@@ -257,7 +265,7 @@ def answer(
                 on_progress=typer.echo,
             )
         else:
-            if not dataset.exists():
+            if str(dataset) != SQLITE_DATASET and not dataset.exists():
                 typer.echo(f"dataset not found: {dataset}", err=True)
                 raise typer.Exit(1)
             selected = create_provider(provider, model=model, temperature=temperature)
@@ -374,6 +382,13 @@ def lint(directory: Path = RUBRICS_OPTION, strict: bool = STRICT_OPTION) -> None
     """Warn about criteria that are hard for a grader to apply."""
     catalog = _require_rubrics(directory)
     warnings = lint_rubrics(catalog)
+    prompts = directory.parent / "prompts"
+    if prompts.is_dir():
+        try:
+            warnings.extend(lint_extra_criteria(load_prompts(prompts, catalog)))
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from None
     if warnings:
         for warning in warnings:
             typer.echo(warning)
@@ -392,9 +407,11 @@ def _require_rubrics(directory: Path) -> dict[str, Rubric]:
 
 
 def _catalog_or_empty(directory: Path) -> dict[str, Rubric]:
-    if not directory.is_dir():
-        return {}
-    return load_rubrics(directory)
+    catalog: dict[str, Rubric] = {}
+    if directory.is_dir():
+        catalog.update(load_rubrics(directory))
+    catalog.update(load_latest_rubrics(directory=DEFAULT_RUNS_DIR))
+    return catalog
 
 
 def _provider_kwargs(resolved: object) -> dict[str, object]:

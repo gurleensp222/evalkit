@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from evalkit.models import CriterionMark, TaskResult
+from evalkit.models import CriterionMark, Task, TaskResult
+from evalkit.rubrics import Rubric, _merge_problems
 
 DEFAULT_RUNS_DIR = Path("runs")
 DATABASE_NAME = "evalkit.db"
+SQLITE_DATASET = "sqlite"
 RUN_STATUSES = ("answering", "answered", "grading", "graded", "interrupted", "failed")
 
 _SCHEMA = """
@@ -57,6 +59,20 @@ CREATE TABLE IF NOT EXISTS grades (
     reason TEXT NOT NULL,
     PRIMARY KEY (run_id, task_id, attempt, judge_model, criterion_id),
     FOREIGN KEY (run_id) REFERENCES runs (run_id)
+);
+
+CREATE TABLE IF NOT EXISTS stored_rubrics (
+    rubric_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    document TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (rubric_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS stored_prompts (
+    prompt_id TEXT PRIMARY KEY,
+    document TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -515,6 +531,137 @@ def run_progress(run_id: str, *, directory: Path = DEFAULT_RUNS_DIR) -> RunProgr
     )
 
 
+def save_rubric(rubric: Rubric, *, directory: Path = DEFAULT_RUNS_DIR) -> Rubric:
+    """Store a new version of a rubric. The previous versions stay in the table."""
+    with _connect(directory) as connection:
+        row = connection.execute(
+            "SELECT MAX(version) AS version FROM stored_rubrics WHERE rubric_id = ?",
+            (rubric.id,),
+        ).fetchone()
+        current = row["version"] if row is not None else None
+        version = 1 if current is None else int(current) + 1
+        stored = rubric.model_copy(update={"version": version})
+        connection.execute(
+            """
+            INSERT INTO stored_rubrics (rubric_id, version, document, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (stored.id, stored.version, stored.model_dump_json(), _now()),
+        )
+    return stored
+
+
+def load_rubric(
+    rubric_id: str,
+    *,
+    directory: Path = DEFAULT_RUNS_DIR,
+    version: int | None = None,
+) -> Rubric | None:
+    """Return one stored rubric. Omit ``version`` for the latest."""
+    if not _database_exists(directory):
+        return None
+    with _connect(directory) as connection:
+        if version is None:
+            row = connection.execute(
+                """
+                SELECT document FROM stored_rubrics
+                WHERE rubric_id = ?
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (rubric_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT document FROM stored_rubrics
+                WHERE rubric_id = ? AND version = ?
+                """,
+                (rubric_id, version),
+            ).fetchone()
+    if row is None:
+        return None
+    return Rubric.model_validate_json(str(row["document"]))
+
+
+def list_rubric_versions(rubric_id: str, *, directory: Path = DEFAULT_RUNS_DIR) -> list[Rubric]:
+    """Return every stored version of one rubric, oldest first."""
+    if not _database_exists(directory):
+        return []
+    with _connect(directory) as connection:
+        rows = connection.execute(
+            """
+            SELECT document FROM stored_rubrics
+            WHERE rubric_id = ?
+            ORDER BY version ASC
+            """,
+            (rubric_id,),
+        ).fetchall()
+    return [Rubric.model_validate_json(str(row["document"])) for row in rows]
+
+
+def load_latest_rubrics(*, directory: Path = DEFAULT_RUNS_DIR) -> dict[str, Rubric]:
+    """Return the newest stored version of each rubric."""
+    if not _database_exists(directory):
+        return {}
+    with _connect(directory) as connection:
+        rows = connection.execute(
+            """
+            SELECT document FROM stored_rubrics
+            WHERE (rubric_id, version) IN (
+                SELECT rubric_id, MAX(version) FROM stored_rubrics GROUP BY rubric_id
+            )
+            ORDER BY rubric_id
+            """
+        ).fetchall()
+    loaded = [Rubric.model_validate_json(str(row["document"])) for row in rows]
+    return {rubric.id: rubric for rubric in loaded}
+
+
+def save_prompt(task: Task, *, directory: Path = DEFAULT_RUNS_DIR) -> Task:
+    """Insert a prompt, or replace the one with the same id."""
+    with _connect(directory) as connection:
+        connection.execute(
+            """
+            INSERT INTO stored_prompts (prompt_id, document, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(prompt_id) DO UPDATE SET
+                document = excluded.document,
+                created_at = excluded.created_at
+            """,
+            (task.id, task.model_dump_json(), _now()),
+        )
+    return task
+
+
+def load_stored_prompts(
+    directory: Path = DEFAULT_RUNS_DIR,
+    rubrics: Mapping[str, Rubric] | None = None,
+) -> list[Task]:
+    """Return stored prompts in id order.
+
+    When ``rubrics`` is given, a prompt whose rubric id is missing raises
+    ``ValueError``, the same way a prompt file does.
+    """
+    if not _database_exists(directory):
+        return []
+    with _connect(directory) as connection:
+        rows = connection.execute(
+            "SELECT document FROM stored_prompts ORDER BY prompt_id"
+        ).fetchall()
+    tasks = [Task.model_validate_json(str(row["document"])) for row in rows]
+    if rubrics is None:
+        return tasks
+    missing = [task.id for task in tasks if task.rubric_id and task.rubric_id not in rubrics]
+    problems = []
+    if missing:
+        problems.append("unknown rubric_id for prompt ids: " + ", ".join(missing))
+    problems.extend(_merge_problems(tasks, rubrics))
+    if problems:
+        raise ValueError("\n".join(problems))
+    return tasks
+
+
 def list_run_ids(*, directory: Path = DEFAULT_RUNS_DIR) -> list[str]:
     """Return saved run ids in alphabetical order."""
     database = directory / DATABASE_NAME
@@ -523,6 +670,10 @@ def list_run_ids(*, directory: Path = DEFAULT_RUNS_DIR) -> list[str]:
     with _connect(directory) as connection:
         rows = connection.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
     return [str(row["run_id"]) for row in rows]
+
+
+def _database_exists(directory: Path) -> bool:
+    return (directory / DATABASE_NAME).is_file()
 
 
 @contextmanager

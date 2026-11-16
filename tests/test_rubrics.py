@@ -10,7 +10,14 @@ from typer.testing import CliRunner
 from evalkit.cli import app
 from evalkit.models import Task
 from evalkit.providers import MockProvider, create_judge_provider
-from evalkit.rubrics import Rubric, lint_rubrics, load_prompts, load_rubrics
+from evalkit.rubrics import (
+    Rubric,
+    applied_rubric,
+    lint_rubrics,
+    load_prompts,
+    load_rubrics,
+    merge_rubric,
+)
 from evalkit.runner import run_eval
 from evalkit.storage import load_results, save_results
 
@@ -549,3 +556,176 @@ def test_cli_lint_prints_ids_and_does_not_fail(tmp_path: Path) -> None:
     missing = runner.invoke(app, ["rubrics", "lint", "--directory", str(tmp_path / "absent")])
     assert missing.exit_code == 1
     assert "rubric directory not found" in missing.stdout + (missing.stderr or "")
+
+
+def test_extra_criteria_keep_relative_weights_and_then_sum_to_one() -> None:
+    payload = _rubric()
+    payload["criteria"] = [
+        _criterion("one", 0.6, "First part."),
+        _implicit(0.4),
+    ]
+    rubric = Rubric.model_validate(payload)
+    extra = Rubric.model_validate(
+        {
+            "id": "extra",
+            "version": 1,
+            "description": "holder",
+            "pass_threshold": 1,
+            "criteria": [_criterion("cite", 1.0, "The reply names the source page.")],
+        }
+    ).criteria[0]
+    extra = extra.model_copy(update={"weight": 0.5})
+    merged = merge_rubric(rubric, [extra])
+    assert [item.weight for item in rubric.criteria] == [0.6, 0.4]
+    assert merged.criteria[0].weight / merged.criteria[1].weight == pytest.approx(0.6 / 0.4)
+    assert merged.criteria[2].id == "cite"
+    assert merged.criteria[2].weight == pytest.approx(0.5 / 1.5)
+    assert sum(item.weight for item in merged.criteria) == pytest.approx(1)
+    assert merged.content_hash != rubric.content_hash
+    assert merge_rubric(rubric, []).content_hash == rubric.content_hash
+
+
+def test_duplicate_extra_criterion_ids_are_rejected(tmp_path: Path) -> None:
+    rubric = Rubric.model_validate(_rubric())
+    extra = Rubric.model_validate(
+        {
+            "id": "extra",
+            "version": 1,
+            "description": "holder",
+            "pass_threshold": 1,
+            "criteria": [_criterion("one", 1.0, "Again.")],
+        }
+    ).criteria[0]
+    with pytest.raises(ValueError, match="duplicate criterion ids: one"):
+        merge_rubric(rubric, [extra])
+
+    path = tmp_path / "prompts.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "ask",
+                "category": "support",
+                "prompt": "Hello",
+                "rubric_id": "demo",
+                "extra_criteria": [_criterion("one", 0.2, "Again.")],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ask: duplicate criterion ids: one"):
+        load_prompts(path, {"demo": rubric})
+
+
+def test_grader_prompt_includes_extra_criteria_and_stores_the_merged_hash() -> None:
+    rubric = Rubric.model_validate(_rubric())
+    task = Task(
+        id="ask",
+        category="support",
+        prompt="Where is the policy?",
+        rubric_id="demo",
+        extra_criteria=[_criterion("cite", 0.25, "The reply names the source page.")],
+    )
+    merged = applied_rubric(task, {"demo": rubric})
+    assert merged is not None
+
+    class Judge:
+        name = "judge"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate(self, prompt: str, **kwargs: object) -> str:
+            del kwargs
+            self.prompts.append(prompt)
+            return json.dumps(
+                {
+                    "criteria": [
+                        {"id": item.id, "met": True, "reason": "yes"} for item in merged.criteria
+                    ]
+                }
+            )
+
+    judge = Judge()
+    results = run_eval(
+        [task],
+        MockProvider({"ask": "The policy is on the account page."}),
+        "merged",
+        judge=judge,
+        rubrics={"demo": rubric},
+        repeats=1,
+        retries=1,
+    )
+    assert "cite" in judge.prompts[0]
+    assert results[0].passed is True
+    assert results[0].rubric_hash == merged.content_hash
+    assert results[0].rubric_hash != rubric.content_hash
+
+
+def test_fabricated_link_overrides_the_grader() -> None:
+    rubric = Rubric.model_validate(_rubric())
+    task = Task(
+        id="ask",
+        category="support",
+        prompt="Where is the policy?",
+        rubric_id="demo",
+        allowed_urls=["https://example.com/policy"],
+        deterministic_checks=["no_fabricated_links"],
+    )
+
+    class Judge:
+        name = "judge"
+
+        def generate(self, prompt: str, **kwargs: object) -> str:
+            del prompt, kwargs
+            raise AssertionError("grader ran")
+
+    results = run_eval(
+        [task],
+        MockProvider({"ask": "See https://evil.example/phish"}),
+        "links",
+        judge=Judge(),
+        rubrics={"demo": rubric},
+        repeats=1,
+        retries=1,
+    )
+    assert results[0].passed is False
+    assert results[0].failure_type == "critical:no_fabricated_links"
+    assert "https://evil.example/phish" in results[0].reason
+    assert results[0].rubric_hash == rubric.content_hash
+
+
+def test_lint_warns_on_extra_criteria(tmp_path: Path) -> None:
+    rubrics = tmp_path / "rubrics"
+    prompts = tmp_path / "prompts"
+    _write(rubrics, "demo.yaml", _rubric("demo"))
+    prompts.mkdir()
+    (prompts / "ask.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "ask",
+                "category": "support",
+                "prompt": "Hello",
+                "rubric_id": "demo",
+                "extra_criteria": [
+                    _criterion(
+                        "tone",
+                        0.2,
+                        "The reply follows instructions.",
+                        necessity="explicit",
+                        kind="subjective",
+                        example="It restates the request.",
+                        answer_key=None,
+                    )
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    warned = runner.invoke(app, ["rubrics", "lint", "--directory", str(rubrics)])
+    assert warned.exit_code == 0
+    assert "ask tone: criterion is generic" in warned.stdout
+    strict = runner.invoke(app, ["rubrics", "lint", "--strict", "--directory", str(rubrics)])
+    assert strict.exit_code == 1

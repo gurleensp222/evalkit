@@ -8,12 +8,13 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from evalkit.models import Task
+if TYPE_CHECKING:
+    from evalkit.models import Task
 
 _LEVELS = {1, 2, 3, 4, 5}
 _WEIGHT_TOLERANCE = 1e-6
@@ -149,9 +150,6 @@ class Criterion(BaseModel):
         if self.kind == "subjective" and not _present(self.example):
             raise ValueError("subjective criteria require example")
         return self
-
-
-Task.model_rebuild(_types_namespace={"Criterion": Criterion})
 
 
 class Rubric(BaseModel):
@@ -306,6 +304,7 @@ def load_prompts(path: str | Path, rubrics: Mapping[str, Rubric]) -> list[Task]:
 
     Raises one error listing every prompt id whose ``rubric_id`` is not loaded.
     """
+    from evalkit.models import Task
     files = _prompt_files(Path(path))
     tasks: list[Task] = []
     problems: list[str] = []

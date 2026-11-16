@@ -452,3 +452,29 @@ def test_no_fabricated_links_checks_bare_and_markdown_urls() -> None:
             ["https://example.com/docs"],
         )
     )
+
+
+def test_no_fabricated_links_treats_equivalent_urls_as_allowed() -> None:
+    allowed = ["https://example.com/docs"]
+    assert_passed(no_fabricated_links("See https://example.com/docs/", allowed))
+    assert_passed(no_fabricated_links("See https://EXAMPLE.COM/docs", allowed))
+    assert_passed(no_fabricated_links("See https://example.com:443/docs#", allowed))
+    assert_passed(no_fabricated_links("See http://example.com:80/docs#", ["http://example.com/docs"]))
+    assert_passed(
+        no_fabricated_links(
+            "See https://example.com/docs",
+            ["HTTPS://EXAMPLE.COM:443/docs/#"],
+        )
+    )
+
+
+def test_no_fabricated_links_rejects_a_different_path() -> None:
+    result = no_fabricated_links("See https://example.com/other", ["https://example.com/docs"])
+    assert_failed(result)
+    assert "https://example.com/other" in result.reason
+    changed_case = no_fabricated_links(
+        "See https://example.com/Docs",
+        ["https://example.com/docs"],
+    )
+    assert_failed(changed_case)
+    assert "https://example.com/Docs" in changed_case.reason

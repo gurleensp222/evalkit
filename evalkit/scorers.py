@@ -24,6 +24,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from evalkit.models import ScoreResult
 from evalkit.providers import Provider
@@ -378,21 +379,54 @@ def extract_urls(text: str) -> list[str]:
     return found
 
 
+def _normalize_url(url: str) -> str:
+    """Compare URLs after scheme, host, default port, slash, and empty fragment.
+
+    The path, query, and a non-empty fragment stay case-sensitive. ``:80`` is
+    dropped for http and ``:443`` for https. A trailing slash on the path and a
+    trailing ``#`` are dropped.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return url
+    host = (hostname or "").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    auth = ""
+    if parts.username is not None:
+        auth = parts.username
+        if parts.password is not None:
+            auth += f":{parts.password}"
+        auth += "@"
+    netloc = auth + host
+    if port is not None:
+        netloc += f":{port}"
+    path = parts.path.removesuffix("/")
+    return urlunsplit((scheme, netloc, path, parts.query, parts.fragment))
+
+
 def no_fabricated_links(output: str, allowed_urls: Any) -> ScoreResult:
     """Fail when the answer contains an http(s) URL that is not allowed.
 
     ``allowed_urls`` is a list. An empty list allows no links. An answer with
-    no links passes.
+    no links passes. Comparison lowercases the scheme and host, drops a
+    trailing slash, drops default ports, and drops a trailing ``#``.
     """
     if not isinstance(output, str):
         return _failed("no_fabricated_links requires string output")
     if allowed_urls is None:
         allowed: set[str] = set()
     elif isinstance(allowed_urls, list) and all(isinstance(item, str) for item in allowed_urls):
-        allowed = set(allowed_urls)
+        allowed = {_normalize_url(url) for url in allowed_urls}
     else:
         return _failed("no_fabricated_links requires a list of URLs")
-    invented = [url for url in extract_urls(output) if url not in allowed]
+    invented = [url for url in extract_urls(output) if _normalize_url(url) not in allowed]
     if invented:
         listed = ", ".join(invented)
         return _failed(f"fabricated link: {listed}")

@@ -33,3 +33,6 @@ class TaskResult(BaseModel):
     passed: bool
     reason: str
     latency_ms: float
+    attempt: int = Field(default=1, ge=1)
+    unstable: bool = False
+    failure_type: str | None = None

@@ -39,7 +39,7 @@ def test_run_eval_scores_right_and_wrong_canned_answers() -> None:
         _task("exact-wrong", expected="Paris"),
         _task("missing-id"),
     ]
-    results = run_eval(tasks, MockProvider(), "run-scores")
+    results = run_eval(tasks, MockProvider(), "run-scores", repeats=1)
 
     assert [result.task_id for result in results] == [
         "exact-right",
@@ -89,7 +89,7 @@ def test_run_eval_preserves_order_when_the_first_task_is_slower() -> None:
 
     tasks = [_task("first"), _task("second")]
     provider = SlowFirst({"first": "4", "second": "4"})
-    results = run_eval(tasks, provider, "order", retries=1, timeout=5)
+    results = run_eval(tasks, provider, "order", retries=1, timeout=5, repeats=1)
     assert [result.task_id for result in results] == ["first", "second"]
     assert all(result.passed for result in results)
 
@@ -107,7 +107,7 @@ def test_run_eval_retries_then_scores_the_successful_output() -> None:
             return super().generate(prompt, task_id=task_id)
 
     provider = Flaky()
-    results = run_eval([_task("t1")], provider, "retry", retries=3, timeout=2)
+    results = run_eval([_task("t1")], provider, "retry", retries=3, timeout=2, repeats=1)
     assert provider.calls == 3
     assert results[0].passed is True
     assert results[0].output == "  4!\n"
@@ -124,7 +124,7 @@ def test_run_eval_records_provider_errors() -> None:
             raise RuntimeError("down")
 
     provider = Down()
-    results = run_eval([_task("t1")], provider, "down", retries=2, timeout=2)
+    results = run_eval([_task("t1")], provider, "down", retries=2, timeout=2, repeats=1)
     assert provider.calls == 2
     assert results[0].passed is False
     assert results[0].score == 0.0
@@ -143,9 +143,10 @@ def test_run_eval_records_timeouts() -> None:
             return "4"
 
     provider = Hung()
-    results = run_eval([_task("t1")], provider, "timeout", retries=2, timeout=0.2)
+    results = run_eval([_task("t1")], provider, "timeout", retries=2, timeout=0.2, repeats=1)
     assert provider.calls == 2
     assert results[0].passed is False
+    assert results[0].failure_type == "timeout"
     assert "timed out" in results[0].reason
     assert results[0].latency_ms < 3000
 
@@ -171,7 +172,7 @@ def test_run_eval_uses_at_most_four_workers() -> None:
 
     provider = Tracking()
     tasks = [_task(f"t{index}") for index in range(8)]
-    results = run_eval(tasks, provider, "pool", retries=1, timeout=5)
+    results = run_eval(tasks, provider, "pool", retries=1, timeout=5, repeats=1)
     assert len(results) == 8
     assert all(result.passed for result in results)
     assert 2 <= provider.peak <= MAX_WORKERS
@@ -192,7 +193,7 @@ class _Judge:
 def test_run_eval_asks_the_judge_and_stores_the_scaled_score() -> None:
     judge = _Judge('{"score": 4, "reason": "meets the rubric"}')
     task = _task("judged", scorer="llm_judge", expected="digits only")
-    results = run_eval([task], MockProvider(), "judged-run", judge=judge)
+    results = run_eval([task], MockProvider(), "judged-run", judge=judge, repeats=1)
     assert results[0].output == "I don't know"
     assert results[0].score == 0.75
     assert results[0].passed is True
@@ -206,6 +207,7 @@ def test_run_eval_records_a_missing_judge() -> None:
         [_task("judged", scorer="llm_judge", expected="digits only")],
         MockProvider({"judged": "4"}),
         "no-judge",
+        repeats=1,
     )
     assert results[0].output == "4"
     assert results[0].passed is False
@@ -217,16 +219,58 @@ def test_run_eval_reports_an_unknown_scorer() -> None:
         [_task("exact-right", scorer="not-a-scorer")],
         MockProvider(),
         "bad-scorer",
+        repeats=1,
     )
     assert results[0].output == "4"
     assert results[0].passed is False
     assert results[0].reason == "unknown scorer: not-a-scorer"
 
 
+def test_run_eval_flags_answers_that_change_across_attempts() -> None:
+    class Vary(MockProvider):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.calls = 0
+
+        def generate(self, prompt: str, *, task_id: str | None = None) -> str:
+            self.calls += 1
+            return "4" if self.calls == 1 else "5"
+
+    results = run_eval([_task("t1")], Vary(), "unstable", retries=1, repeats=3)
+    assert [result.attempt for result in results] == [1, 2, 3]
+    assert all(result.unstable for result in results)
+    assert results[0].passed is True
+    assert results[0].failure_type is None
+    assert results[1].failure_type == "wrong answer"
+    assert results[2].failure_type == "wrong answer"
+
+
+def test_run_eval_keeps_stable_answers_unflagged() -> None:
+    results = run_eval([_task("exact-right")], MockProvider(), "stable", repeats=3)
+    assert len(results) == 3
+    assert all(result.passed for result in results)
+    assert all(not result.unstable for result in results)
+    assert all(result.failure_type is None for result in results)
+
+
+def test_run_eval_labels_refusal_and_format_failures() -> None:
+    refused = run_eval([_task("missing")], MockProvider({}), "refuse", repeats=1)
+    assert refused[0].output == "I don't know"
+    assert refused[0].failure_type == "refusal"
+
+    malformed = run_eval(
+        [_task("json", scorer="json_valid", expected={"required_keys": ["a"]})],
+        MockProvider({"json": "not json"}),
+        "format",
+        repeats=1,
+    )
+    assert malformed[0].failure_type == "format error"
+
+
 def test_save_and_load_results_roundtrip(tmp_path: Path) -> None:
     results = run_eval([_task("exact-right"), _task("exact-wrong", expected="Paris")], MockProvider(), "persist")
     path = save_results("persist", results, directory=tmp_path)
-    assert path == tmp_path / "persist.jsonl"
+    assert path == tmp_path / "evalkit.db"
     assert load_results("persist", directory=tmp_path) == results
 
 
@@ -270,8 +314,8 @@ def test_cli_run_and_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert completed.exit_code == 0
     assert "run_id: cli-run" in completed.stdout
-    assert "passed: 4" in completed.stdout
-    assert (tmp_path / "runs" / "cli-run.jsonl").is_file()
+    assert "passed: 12" in completed.stdout
+    assert (tmp_path / "runs" / "evalkit.db").is_file()
 
     reported = CLI.invoke(app, ["report", "cli-run"])
     assert reported.exit_code == 0

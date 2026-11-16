@@ -15,7 +15,35 @@ from evalkit.scorers import SCORERS, llm_judge
 
 MAX_WORKERS = 4
 DEFAULT_RETRIES = 3
+DEFAULT_REPEATS = 3
 DEFAULT_TIMEOUT_SECONDS = 30.0
+FAILURE_TIMEOUT = "timeout"
+FAILURE_FORMAT = "format error"
+FAILURE_REFUSAL = "refusal"
+FAILURE_WRONG = "wrong answer"
+
+_FORMAT_MARKERS = (
+    "invalid json",
+    "missing keys",
+    "must be an object",
+    "no code",
+    "syntaxerror",
+    "json_valid",
+)
+_REFUSAL_MARKERS = (
+    "i don't know",
+    "i dont know",
+    "i can't",
+    "i cannot",
+    "i won't",
+    "i will not",
+    "as an ai",
+    "i'm sorry",
+    "i am sorry",
+    "cannot assist",
+    "i'm unable",
+    "i am unable",
+)
 
 
 def load_tasks(path: str | Path) -> list[Task]:
@@ -42,13 +70,17 @@ def run_eval(
     retries: int = DEFAULT_RETRIES,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     judge: Provider | None = None,
+    repeats: int = DEFAULT_REPEATS,
 ) -> list[TaskResult]:
-    """Score every task with the provider and return one result per task, in order.
+    """Score every task ``repeats`` times and return the attempts in task order.
 
-    ``judge`` grades tasks whose scorer is ``llm_judge``.
+    Answers that differ across attempts are marked unstable. ``judge`` grades
+    tasks whose scorer is ``llm_judge``.
     """
     if retries < 1:
         raise ValueError("retries must be at least 1")
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
 
@@ -56,18 +88,28 @@ def run_eval(
     if not loaded:
         return []
 
-    def evaluate(task: Task) -> TaskResult:
-        return _evaluate_task(
-            task,
-            provider,
-            run_id,
-            retries=retries,
-            timeout=timeout,
-            judge=judge,
-        )
+    def evaluate(task: Task) -> list[TaskResult]:
+        attempts = [
+            _evaluate_task(
+                task,
+                provider,
+                run_id,
+                retries=retries,
+                timeout=timeout,
+                judge=judge,
+                attempt=attempt,
+            )
+            for attempt in range(1, repeats + 1)
+        ]
+        unstable = len({result.output.strip() for result in attempts}) > 1
+        if unstable:
+            for result in attempts:
+                result.unstable = True
+        return attempts
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        return list(executor.map(evaluate, loaded))
+        grouped = executor.map(evaluate, loaded)
+        return [result for attempts in grouped for result in attempts]
 
 
 def _coerce_tasks(tasks: str | Path | Sequence[Task | Mapping[str, Any]]) -> list[Task]:
@@ -90,6 +132,7 @@ def _evaluate_task(
     retries: int,
     timeout: float,
     judge: Provider | None,
+    attempt: int,
 ) -> TaskResult:
     started = time.perf_counter()
     output = ""
@@ -116,7 +159,24 @@ def _evaluate_task(
         passed=scored.passed,
         reason=scored.reason,
         latency_ms=elapsed_ms,
+        attempt=attempt,
+        failure_type=failure_type_for(output, scored.reason, passed=scored.passed),
     )
+
+
+def failure_type_for(output: str, reason: str, *, passed: bool) -> str | None:
+    """Label a failed attempt. Passed attempts have no failure type."""
+    if passed:
+        return None
+    folded_reason = reason.casefold()
+    folded_output = output.casefold()
+    if "timed out" in folded_reason:
+        return FAILURE_TIMEOUT
+    if any(marker in folded_reason for marker in _FORMAT_MARKERS):
+        return FAILURE_FORMAT
+    if any(marker in folded_output or marker in folded_reason for marker in _REFUSAL_MARKERS):
+        return FAILURE_REFUSAL
+    return FAILURE_WRONG
 
 
 def _generate_with_retries(

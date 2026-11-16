@@ -14,6 +14,7 @@ from evalkit.storage import DEFAULT_RUNS_DIR, load_results
 RESULT_COLUMNS = [
     "run_id",
     "task_id",
+    "attempt",
     "category",
     "model",
     "output",
@@ -21,8 +22,10 @@ RESULT_COLUMNS = [
     "passed",
     "reason",
     "latency_ms",
+    "failure_type",
+    "unstable",
 ]
-FAILURE_COLUMNS = ["category", "task_id", "model", "run_id", "score", "reason"]
+FAILURE_COLUMNS = ["category", "task_id", "attempt", "model", "run_id", "score", "reason", "failure_type"]
 BOOTSTRAP_RESAMPLES = 1000
 BOOTSTRAP_SEED = 0
 
@@ -101,7 +104,11 @@ def failures(df: pd.DataFrame) -> pd.DataFrame:
     """Failed tasks and their reasons, sorted by category."""
     columns = [column for column in FAILURE_COLUMNS if column in df.columns]
     failed = df.loc[~df["passed"].astype(bool), columns]
-    sort_by = [column for column in ("category", "task_id", "model") if column in failed.columns]
+    sort_by = [
+        column
+        for column in ("category", "task_id", "attempt", "model")
+        if column in failed.columns
+    ]
     if failed.empty or not sort_by:
         return failed.reset_index(drop=True)
     return failed.sort_values(sort_by, kind="mergesort").reset_index(drop=True)

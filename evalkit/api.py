@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from evalkit.analysis import by_category, compare, failures, load_runs, summary
 from evalkit.providers import ProviderError, create_provider
 from evalkit.runner import load_tasks, run_eval
-from evalkit.storage import DEFAULT_RUNS_DIR, load_results, save_results
+from evalkit.storage import DEFAULT_RUNS_DIR, list_run_ids, load_results, save_results
 
 DEFAULT_DATASET = Path("datasets/sample_tasks.jsonl")
 RunStatusName = Literal["running", "completed", "failed"]
@@ -99,6 +99,8 @@ class FailureOut(BaseModel):
     run_id: str
     score: float
     reason: str
+    failure_type: str | None = None
+    attempt: int = 1
 
 
 class CompareResponse(BaseModel):
@@ -287,21 +289,20 @@ def _update_state(
 def _all_states(app: FastAPI) -> list[_RunState]:
     with app.state.lock:
         known = {state.run_id: state for state in app.state.runs.values()}
-    directory = Path(app.state.runs_directory)
-    if directory.is_dir():
-        for path in directory.glob("*.jsonl"):
-            if path.stem not in known:
-                known[path.stem] = _state_from_disk(app, path.stem)
+    for run_id in list_run_ids(directory=Path(app.state.runs_directory)):
+        if run_id not in known:
+            known[run_id] = _state_from_disk(app, run_id)
     return [known[run_id] for run_id in sorted(known)]
 
 
 def _require_state(app: FastAPI, run_id: str) -> _RunState:
+    if not run_id or run_id in {".", ".."} or any(sep in run_id for sep in ("/", "\\", "\0")):
+        raise HTTPException(status_code=400, detail=f"invalid run id: {run_id}")
     with app.state.lock:
         state = app.state.runs.get(run_id)
     if state is not None:
         return state
-    path = _run_file(app, run_id)
-    if path.is_file():
+    if run_id in list_run_ids(directory=Path(app.state.runs_directory)):
         return _state_from_disk(app, run_id)
     raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
 
@@ -318,12 +319,6 @@ def _state_from_disk(app: FastAPI, run_id: str) -> _RunState:
         provider=provider or "",
         dataset="",
     )
-
-
-def _run_file(app: FastAPI, run_id: str) -> Path:
-    if not run_id or run_id in {".", ".."} or any(sep in run_id for sep in ("/", "\\", "\0")):
-        raise HTTPException(status_code=400, detail=f"invalid run id: {run_id}")
-    return Path(app.state.runs_directory) / f"{run_id}.jsonl"
 
 
 def _frame_or_empty(app: FastAPI, state: _RunState) -> pd.DataFrame:

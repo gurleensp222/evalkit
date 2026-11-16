@@ -71,8 +71,9 @@ def test_mock_run_summary_and_failures(client: TestClient, dataset: Path) -> Non
     failed = client.get(f"/runs/{run_id}/failures")
     assert failed.status_code == 200
     reasons = failed.json()
-    assert [item["task_id"] for item in reasons] == ["exact-wrong"]
+    assert [item["task_id"] for item in reasons] == ["exact-wrong", "exact-wrong", "exact-wrong"]
     assert reasons[0]["category"] == "knowledge"
+    assert reasons[0]["failure_type"] == "wrong answer"
     assert "Paris" in reasons[0]["reason"]
 
 

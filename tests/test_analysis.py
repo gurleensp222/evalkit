@@ -22,7 +22,7 @@ def _result(run_id: str, task_id: str, model: str, passed: bool) -> TaskResult:
     )
 
 
-def test_load_runs_stacks_saved_jsonl_files(tmp_path: Path) -> None:
+def test_load_runs_stacks_saved_runs(tmp_path: Path) -> None:
     save_results("run-a", [_result("run-a", "t1", "alpha", True)], directory=tmp_path)
     save_results("run-b", [_result("run-b", "t1", "beta", False)], directory=tmp_path)
 

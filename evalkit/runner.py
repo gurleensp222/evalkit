@@ -46,6 +46,13 @@ _REFUSAL_MARKERS = (
 )
 
 
+def ensure_model_available(provider: Provider) -> None:
+    """Ask the provider to confirm its model is installed, when it can."""
+    checker = getattr(provider, "check_model_available", None)
+    if callable(checker):
+        checker()
+
+
 def load_tasks(path: str | Path) -> list[Task]:
     """Load a JSONL dataset. Blank lines are ignored."""
     dataset = Path(path)
@@ -68,23 +75,33 @@ def run_eval(
     run_id: str,
     *,
     retries: int = DEFAULT_RETRIES,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    timeout: float | None = None,
     judge: Provider | None = None,
     repeats: int = DEFAULT_REPEATS,
+    workers: int | None = None,
 ) -> list[TaskResult]:
     """Score every task ``repeats`` times and return the attempts in task order.
 
-    Answers that differ across attempts are marked unstable. ``judge`` grades
-    tasks whose scorer is ``llm_judge``.
+    A task is unstable when its attempts disagree on ``passed``. ``output_varies``
+    is set when the answer text differs. ``judge`` grades ``llm_judge`` tasks.
+    Ollama defaults to one worker and a 120 second HTTP timeout. A provider with
+    ``check_model_available`` is checked before any task runs.
     """
+    if timeout is None:
+        timeout = float(getattr(provider, "default_timeout", DEFAULT_TIMEOUT_SECONDS))
+    if workers is None:
+        workers = int(getattr(provider, "default_workers", MAX_WORKERS))
     if retries < 1:
         raise ValueError("retries must be at least 1")
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
 
     loaded = _coerce_tasks(tasks)
+    ensure_model_available(provider)
     if not loaded:
         return []
 
@@ -101,13 +118,14 @@ def run_eval(
             )
             for attempt in range(1, repeats + 1)
         ]
-        unstable = len({result.output.strip() for result in attempts}) > 1
-        if unstable:
-            for result in attempts:
-                result.unstable = True
+        unstable = len({result.passed for result in attempts}) > 1
+        output_varies = len({result.output.strip() for result in attempts}) > 1
+        for result in attempts:
+            result.unstable = unstable
+            result.output_varies = output_varies
         return attempts
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         grouped = executor.map(evaluate, loaded)
         return [result for attempts in grouped for result in attempts]
 
@@ -199,6 +217,12 @@ def _generate_with_retries(
 
 
 def _generate_once(provider: Provider, prompt: str, task_id: str, timeout: float) -> str:
+    if getattr(provider, "uses_http_timeout", False):
+        value = provider.generate(prompt, task_id=task_id, timeout=timeout)
+        if not isinstance(value, str):
+            raise TypeError("provider.generate must return str")
+        return value
+
     box: dict[str, object] = {}
 
     def target() -> None:

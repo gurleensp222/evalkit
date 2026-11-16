@@ -37,15 +37,26 @@ def main() -> None:
     st.subheader("Failures")
     st.dataframe(failures(frame), use_container_width=True)
 
-    unstable = frame.loc[frame["unstable"].astype(bool)]
+    changed = frame.loc[frame["unstable"].astype(bool) | frame["output_varies"].astype(bool)]
     st.subheader("Unstable answers")
-    if unstable.empty:
-        st.write("No task changed its answer across attempts.")
+    if changed.empty:
+        st.write("No task changed its pass result or its answer text.")
         return
-    st.dataframe(
-        unstable[["run_id", "task_id", "attempt", "model", "output", "passed"]],
-        use_container_width=True,
-    )
+    columns = [
+        column
+        for column in (
+            "run_id",
+            "task_id",
+            "attempt",
+            "model",
+            "output",
+            "passed",
+            "unstable",
+            "output_varies",
+        )
+        if column in changed.columns
+    ]
+    st.dataframe(changed[columns], use_container_width=True)
 
 
 main()

@@ -35,4 +35,5 @@ class TaskResult(BaseModel):
     latency_ms: float
     attempt: int = Field(default=1, ge=1)
     unstable: bool = False
+    output_varies: bool = False
     failure_type: str | None = None

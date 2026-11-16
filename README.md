@@ -17,14 +17,14 @@ Local mock run of `datasets/sample_tasks.jsonl` (run `4824ed0c60ef432486202289b9
 
 | Task | Category | Result | Reason |
 | --- | --- | --- | --- |
-| exact-right | math | pass | exact match |
-| python-right | code | pass | all asserts passed |
-| python-wrong | code | fail | assertion failed |
-| json-right | format | pass | valid JSON with required keys |
-| json-wrong | format | fail | missing key `b` |
-| contains-right | knowledge | pass | all expected strings found |
-| contains-wrong | knowledge | fail | missing mercury, venus, earth |
-| exact-wrong | knowledge | fail | expected Paris, got Lyon |
+| two-plus-two | math | pass | exact match |
+| add-function | code | pass | all asserts passed |
+| add-function-arguments | code | fail | assertion failed |
+| name-and-city | format | pass | valid JSON with required keys |
+| keys-a-and-b | format | fail | missing key `b` |
+| primary-colors | knowledge | pass | all expected strings found |
+| closest-planets | knowledge | fail | missing mercury, venus, earth |
+| capital-of-france | knowledge | fail | expected Paris, got Lyon |
 
 A second mock run of the same file (`0c905dadf98844598c0ad95e53fdf18f`) matched task for task. `compare()` reported a difference of 0.00 with interval [0.00, 0.00].
 
@@ -34,9 +34,19 @@ Create an empty `.env` in the project directory. Compose reads that file on star
 
 ```bash
 docker compose up --build
+docker compose exec ollama ollama pull llama3.2
 ```
 
-The API listens on http://localhost:8000. Interactive docs are at http://localhost:8000/docs, and saved runs are written to `./runs`.
+The API listens on http://localhost:8000. Interactive docs are at http://localhost:8000/docs, and saved runs are written to `./runs`. Compose also starts an `ollama` service and sets `OLLAMA_URL=http://ollama:11434` on the API. Model files stay in the `ollama_models` volume.
+
+When Ollama is already running on the host, delete the compose `ollama` service and the API `depends_on` block, and point the API at the host instead:
+
+```yaml
+environment:
+  OLLAMA_URL: http://host.docker.internal:11434
+```
+
+`host.docker.internal` is the machine running Docker Desktop. The API container then uses the models you already pulled on the host.
 
 For a local mock run without Docker:
 
@@ -44,6 +54,13 @@ For a local mock run without Docker:
 python -m pip install -e ".[dev]"
 evalkit run --provider mock
 evalkit report <run_id>
+evalkit show <run_id> <task_id>
+```
+
+An Ollama run records the model id, not the word `ollama`:
+
+```bash
+evalkit run --provider ollama --model llama3.2 --temperature 0.2
 ```
 
 `evalkit run` prints a run id, a pass count, and one line per task. CI runs this same command and fails if the sample pass rate drops below 0.50.

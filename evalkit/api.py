@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from evalkit.analysis import by_category, compare, failures, load_runs, summary
 from evalkit.providers import ProviderError, create_provider
-from evalkit.runner import load_tasks, run_eval
+from evalkit.runner import ensure_model_available, load_tasks, run_eval
 from evalkit.storage import DEFAULT_RUNS_DIR, list_run_ids, load_results, save_results
 
 DEFAULT_DATASET = Path("datasets/sample_tasks.jsonl")
@@ -47,6 +47,19 @@ class RunCreate(BaseModel):
     dataset: str = Field(
         examples=["datasets/sample_tasks.jsonl"],
         description="Path to a JSONL task file.",
+    )
+    model: str | None = Field(
+        default=None,
+        description="Model id. Ollama defaults to llama3.2.",
+    )
+    temperature: float | None = Field(
+        default=None,
+        description="Sampling temperature for Ollama.",
+    )
+    workers: int | None = Field(
+        default=None,
+        ge=1,
+        description="How many tasks to run at once. Ollama uses 1 unless this is set.",
     )
 
 
@@ -177,7 +190,8 @@ def start_run(body: RunCreate, request: Request, background: BackgroundTasks) ->
     if not dataset.is_file():
         raise HTTPException(status_code=404, detail=f"dataset not found: {dataset}")
     try:
-        create_provider(body.provider)
+        selected = create_provider(body.provider, model=body.model, temperature=body.temperature)
+        ensure_model_available(selected)
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
@@ -191,7 +205,16 @@ def start_run(body: RunCreate, request: Request, background: BackgroundTasks) ->
             dataset=str(dataset),
         ),
     )
-    background.add_task(_execute_run, request.app, run_id, body.provider, dataset)
+    background.add_task(
+        _execute_run,
+        request.app,
+        run_id,
+        body.provider,
+        dataset,
+        model=body.model,
+        temperature=body.temperature,
+        workers=body.workers,
+    )
     return RunCreated(run_id=run_id, status="running")
 
 
@@ -250,10 +273,19 @@ def compare_runs(
     return CompareResponse.model_validate(result)
 
 
-def _execute_run(app: FastAPI, run_id: str, provider_name: str, dataset: Path) -> None:
+def _execute_run(
+    app: FastAPI,
+    run_id: str,
+    provider_name: str,
+    dataset: Path,
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    workers: int | None = None,
+) -> None:
     try:
-        provider = create_provider(provider_name)
-        results = run_eval(dataset, provider, run_id)
+        provider = create_provider(provider_name, model=model, temperature=temperature)
+        results = run_eval(dataset, provider, run_id, workers=workers)
         save_results(run_id, results, directory=app.state.runs_directory)
     except Exception as exc:  # noqa: BLE001 - record the failure instead of dropping the run
         _update_state(app, run_id, status="failed", error=str(exc))

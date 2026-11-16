@@ -5,5 +5,19 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
     volumes:
       - ./runs:/app/runs
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
+volumes:
+  ollama_models:

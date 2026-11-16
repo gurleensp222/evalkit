@@ -14,7 +14,8 @@ DATABASE_NAME = "evalkit.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY
+    run_id TEXT PRIMARY KEY,
+    model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS results (
     latency_ms REAL NOT NULL,
     failure_type TEXT,
     unstable INTEGER NOT NULL,
+    output_varies INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, task_id, attempt),
     FOREIGN KEY (run_id) REFERENCES runs (run_id)
 );
@@ -38,8 +40,8 @@ CREATE TABLE IF NOT EXISTS results (
 _INSERT = """
 INSERT INTO results (
     run_id, task_id, attempt, category, model, output, score, passed,
-    reason, latency_ms, failure_type, unstable
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    reason, latency_ms, failure_type, unstable, output_varies
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -52,9 +54,13 @@ def save_results(
     """Replace ``run_id`` in ``runs/evalkit.db`` and return the database path."""
     _validate_run_id(run_id)
     with _connect(directory) as connection:
+        recorded = results[0].model if results else None
         connection.execute(
-            "INSERT INTO runs (run_id) VALUES (?) ON CONFLICT(run_id) DO NOTHING",
-            (run_id,),
+            """
+            INSERT INTO runs (run_id, model) VALUES (?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET model = excluded.model
+            """,
+            (run_id, recorded),
         )
         connection.execute("DELETE FROM results WHERE run_id = ?", (run_id,))
         connection.executemany(_INSERT, [_row(result) for result in results])
@@ -74,7 +80,7 @@ def load_results(run_id: str, *, directory: Path = DEFAULT_RUNS_DIR) -> list[Tas
         rows = connection.execute(
             """
             SELECT run_id, task_id, attempt, category, model, output, score, passed,
-                   reason, latency_ms, failure_type, unstable
+                   reason, latency_ms, failure_type, unstable, output_varies
             FROM results
             WHERE run_id = ?
             ORDER BY rowid
@@ -101,6 +107,8 @@ def _connect(directory: Path) -> Iterator[sqlite3.Connection]:
     connection.row_factory = sqlite3.Row
     try:
         connection.executescript(_SCHEMA)
+        _ensure_output_varies(connection)
+        _ensure_runs_model(connection)
         yield connection
         connection.commit()
     finally:
@@ -121,6 +129,7 @@ def _row(result: TaskResult) -> tuple[object, ...]:
         result.latency_ms,
         result.failure_type,
         int(result.unstable),
+        int(result.output_varies),
     )
 
 
@@ -138,6 +147,33 @@ def _result(row: sqlite3.Row) -> TaskResult:
         latency_ms=row["latency_ms"],
         failure_type=row["failure_type"],
         unstable=bool(row["unstable"]),
+        output_varies=bool(row["output_varies"]),
+    )
+
+
+def _ensure_output_varies(connection: sqlite3.Connection) -> None:
+    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(results)")}
+    if columns and "output_varies" not in columns:
+        connection.execute(
+            "ALTER TABLE results ADD COLUMN output_varies INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _ensure_runs_model(connection: sqlite3.Connection) -> None:
+    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(runs)")}
+    if columns and "model" not in columns:
+        connection.execute("ALTER TABLE runs ADD COLUMN model TEXT")
+    connection.execute(
+        """
+        UPDATE runs
+        SET model = (
+            SELECT results.model FROM results
+            WHERE results.run_id = runs.run_id
+            LIMIT 1
+        )
+        WHERE model IS NULL
+          AND EXISTS (SELECT 1 FROM results WHERE results.run_id = runs.run_id)
+        """
     )
 
 

@@ -179,13 +179,28 @@ def test_post_runs_forwards_model_temperature_and_workers(
     assert response.status_code == 202
     creates = [item for item in seen if item[0] == "create"]
     assert creates[0][2] == {"model": "llama3.1", "temperature": 0.4}
-    assert ("run", {"workers": 2}) in seen
+    run_calls = [item for item in seen if item[0] == "run"]
+    assert run_calls[0][1]["workers"] == 2
+    assert run_calls[0][1]["repeats"] == 3
+
+    once = client.post(
+        "/runs",
+        json={"provider": "mock", "dataset": str(dataset), "attempts": 1},
+    )
+    assert once.status_code == 202
+    run_calls = [item for item in seen if item[0] == "run"]
+    assert run_calls[-1][1]["repeats"] == 1
 
     rejected = client.post(
         "/runs",
         json={"provider": "mock", "dataset": str(dataset), "workers": 0},
     )
     assert rejected.status_code == 422
+    zero_attempts = client.post(
+        "/runs",
+        json={"provider": "mock", "dataset": str(dataset), "attempts": 0},
+    )
+    assert zero_attempts.status_code == 422
 
 
 def test_post_runs_rejects_a_missing_ollama_model(

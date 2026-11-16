@@ -25,6 +25,9 @@ RESULT_COLUMNS = [
     "failure_type",
     "unstable",
     "output_varies",
+    "rubric_id",
+    "rubric_version",
+    "rubric_hash",
 ]
 FAILURE_COLUMNS = ["category", "task_id", "attempt", "model", "run_id", "score", "reason", "failure_type"]
 BOOTSTRAP_RESAMPLES = 1000

@@ -274,6 +274,34 @@ def test_output_text_can_vary_without_marking_the_task_unstable() -> None:
     assert all(result.output_varies for result in results)
 
 
+def test_one_attempt_skips_stability_flags(tmp_path: Path) -> None:
+    class Vary(MockProvider):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.calls = 0
+
+        def generate(self, prompt: str, *, task_id: str | None = None) -> str:
+            del prompt, task_id
+            self.calls += 1
+            return "4" if self.calls == 1 else "5"
+
+    provider = Vary()
+    results = run_eval([_task("two-plus-two")], provider, "once", retries=1, repeats=1)
+    assert provider.calls == 1
+    assert len(results) == 1
+    assert results[0].attempt == 1
+    assert results[0].unstable is False
+    assert results[0].output_varies is False
+    path = save_results("once", results, directory=tmp_path, attempts=1)
+    row = sqlite3.connect(path).execute("SELECT attempts FROM runs WHERE run_id = 'once'").fetchone()
+    assert row == (1,)
+
+
+def test_run_eval_rejects_zero_attempts() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        run_eval([_task("two-plus-two")], MockProvider(), "zero", repeats=0)
+
+
 def test_ollama_uses_one_worker_and_cancels_through_http_timeout() -> None:
     class LocalOllama:
         name = "ollama"
@@ -666,7 +694,32 @@ def test_cli_forwards_model_temperature_and_workers(
         "ollama",
         {"model": "llama3.1", "temperature": 0.2},
     )
-    assert seen["run"] == {"workers": 2}
+    assert seen["run"]["workers"] == 2
+    assert seen["run"]["judge"] is None
+    assert seen["run"]["repeats"] == 3
+
+    once = CLI.invoke(
+        app,
+        [
+            "run",
+            "--dataset",
+            str(DATASET),
+            "--provider",
+            "mock",
+            "--attempts",
+            "1",
+            "--run-id",
+            "once",
+        ],
+    )
+    assert once.exit_code == 0
+    assert seen["run"]["repeats"] == 1
+
+    rejected = CLI.invoke(
+        app,
+        ["run", "--dataset", str(DATASET), "--provider", "mock", "--attempts", "0"],
+    )
+    assert rejected.exit_code != 0
 
 
 def test_cli_stops_when_the_ollama_model_is_missing(

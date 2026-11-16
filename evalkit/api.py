@@ -16,11 +16,13 @@ from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from evalkit.analysis import by_category, compare, failures, load_runs, summary
-from evalkit.providers import ProviderError, create_provider
-from evalkit.runner import ensure_model_available, load_tasks, run_eval
+from evalkit.providers import ProviderError, create_judge_provider, create_provider
+from evalkit.rubrics import Rubric, load_prompts, load_rubrics
+from evalkit.runner import ensure_model_available, run_eval
 from evalkit.storage import DEFAULT_RUNS_DIR, list_run_ids, load_results, save_results
 
 DEFAULT_DATASET = Path("datasets/sample_tasks.jsonl")
+DEFAULT_RUBRICS = Path("datasets/rubrics")
 RunStatusName = Literal["running", "completed", "failed"]
 
 
@@ -36,8 +38,9 @@ class TaskOut(BaseModel):
     id: str
     category: str
     prompt: str
-    scorer: str
-    expected: Any = Field(description="Scorer-specific expected value.")
+    scorer: str | None = None
+    rubric_id: str | None = None
+    expected: Any = Field(default=None, description="Scorer-specific expected value.")
 
 
 class RunCreate(BaseModel):
@@ -60,6 +63,19 @@ class RunCreate(BaseModel):
         default=None,
         ge=1,
         description="How many tasks to run at once. Ollama uses 1 unless this is set.",
+    )
+    judge_provider: str | None = Field(
+        default=None,
+        description="Provider that grades rubric tasks. Uses temperature 0 and JSON output.",
+    )
+    judge_model: str | None = Field(
+        default=None,
+        description="Model id for the judge.",
+    )
+    attempts: int = Field(
+        default=3,
+        ge=1,
+        description="How many times to run each task.",
     )
 
 
@@ -146,11 +162,13 @@ def create_app(
     *,
     runs_directory: Path = DEFAULT_RUNS_DIR,
     default_dataset: Path = DEFAULT_DATASET,
+    rubrics_directory: Path = DEFAULT_RUBRICS,
 ) -> FastAPI:
     """Build the API. Tests pass their own runs directory and dataset."""
     app = FastAPI(title="evalkit", version="0.1.0")
     app.state.runs_directory = runs_directory
     app.state.default_dataset = default_dataset
+    app.state.rubrics_directory = rubrics_directory
     app.state.runs = {}
     app.state.lock = Lock()
     app.include_router(router)
@@ -177,7 +195,7 @@ def list_tasks(
     """List tasks in the dataset."""
     path = _dataset_path(request, dataset)
     try:
-        tasks = load_tasks(path)
+        tasks = load_prompts(path, _rubric_catalog(request))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return [TaskOut.model_validate(task.model_dump()) for task in tasks]
@@ -187,12 +205,21 @@ def list_tasks(
 def start_run(body: RunCreate, request: Request, background: BackgroundTasks) -> RunCreated:
     """Start an evaluation in the background and return its run id."""
     dataset = Path(body.dataset)
-    if not dataset.is_file():
+    if not dataset.exists():
         raise HTTPException(status_code=404, detail=f"dataset not found: {dataset}")
     try:
-        selected = create_provider(body.provider, model=body.model, temperature=body.temperature)
-        ensure_model_available(selected)
+        catalog = _rubric_catalog(request)
+        load_prompts(dataset, catalog)
+        ensure_model_available(
+            create_provider(body.provider, model=body.model, temperature=body.temperature)
+        )
+        if body.judge_provider:
+            ensure_model_available(
+                create_judge_provider(body.judge_provider, model=body.judge_model)
+            )
     except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     run_id = uuid4().hex
@@ -214,6 +241,9 @@ def start_run(body: RunCreate, request: Request, background: BackgroundTasks) ->
         model=body.model,
         temperature=body.temperature,
         workers=body.workers,
+        judge_provider=body.judge_provider,
+        judge_model=body.judge_model,
+        attempts=body.attempts,
     )
     return RunCreated(run_id=run_id, status="running")
 
@@ -282,20 +312,46 @@ def _execute_run(
     model: str | None = None,
     temperature: float | None = None,
     workers: int | None = None,
+    judge_provider: str | None = None,
+    judge_model: str | None = None,
+    attempts: int = 3,
 ) -> None:
     try:
         provider = create_provider(provider_name, model=model, temperature=temperature)
-        results = run_eval(dataset, provider, run_id, workers=workers)
-        save_results(run_id, results, directory=app.state.runs_directory)
+        judge = None
+        if judge_provider:
+            judge = create_judge_provider(judge_provider, model=judge_model)
+        catalog = _rubric_catalog_from_app(app)
+        results = run_eval(
+            dataset,
+            provider,
+            run_id,
+            workers=workers,
+            judge=judge,
+            rubrics=catalog,
+            repeats=attempts,
+        )
+        save_results(run_id, results, directory=app.state.runs_directory, attempts=attempts)
     except Exception as exc:  # noqa: BLE001 - record the failure instead of dropping the run
         _update_state(app, run_id, status="failed", error=str(exc))
         return
     _update_state(app, run_id, status="completed")
 
 
+def _rubric_catalog(request: Request) -> dict[str, Rubric]:
+    return _rubric_catalog_from_app(request.app)
+
+
+def _rubric_catalog_from_app(app: FastAPI) -> dict[str, Rubric]:
+    directory = Path(app.state.rubrics_directory)
+    if not directory.is_dir():
+        return {}
+    return load_rubrics(directory)
+
+
 def _dataset_path(request: Request, dataset: str | None) -> Path:
     path = Path(dataset) if dataset else Path(request.app.state.default_dataset)
-    if not path.is_file():
+    if not path.exists():
         raise HTTPException(status_code=404, detail=f"dataset not found: {path}")
     return path
 

@@ -15,6 +15,7 @@ dependencies = [
     "uvicorn",
     "httpx",
     "typer",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

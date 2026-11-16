@@ -380,11 +380,11 @@ def extract_urls(text: str) -> list[str]:
 
 
 def _normalize_url(url: str) -> str:
-    """Compare URLs after scheme, host, default port, slash, and empty fragment.
+    """Compare URLs after scheme, host, default port, slash, and fragment.
 
-    The path, query, and a non-empty fragment stay case-sensitive. ``:80`` is
-    dropped for http and ``:443`` for https. A trailing slash on the path and a
-    trailing ``#`` are dropped.
+    The path and query stay case-sensitive. ``:80`` is dropped for http and
+    ``:443`` for https. A trailing slash on the path is dropped, and the whole
+    ``#fragment`` is dropped because it points at the same page.
     """
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
@@ -408,7 +408,7 @@ def _normalize_url(url: str) -> str:
     if port is not None:
         netloc += f":{port}"
     path = parts.path.removesuffix("/")
-    return urlunsplit((scheme, netloc, path, parts.query, parts.fragment))
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
 
 
 def no_fabricated_links(output: str, allowed_urls: Any) -> ScoreResult:
@@ -416,7 +416,7 @@ def no_fabricated_links(output: str, allowed_urls: Any) -> ScoreResult:
 
     ``allowed_urls`` is a list. An empty list allows no links. An answer with
     no links passes. Comparison lowercases the scheme and host, drops a
-    trailing slash, drops default ports, and drops a trailing ``#``.
+    trailing slash, drops default ports, and drops the ``#fragment``.
     """
     if not isinstance(output, str):
         return _failed("no_fabricated_links requires string output")

@@ -468,6 +468,15 @@ def test_no_fabricated_links_treats_equivalent_urls_as_allowed() -> None:
     )
 
 
+def test_no_fabricated_links_allows_a_fragment_on_an_allowed_page() -> None:
+    assert_passed(
+        no_fabricated_links(
+            "See https://example.com/help#top",
+            ["https://example.com/help"],
+        )
+    )
+
+
 def test_no_fabricated_links_rejects_a_different_path() -> None:
     result = no_fabricated_links("See https://example.com/other", ["https://example.com/docs"])
     assert_failed(result)

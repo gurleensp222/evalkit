@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Thread
 from typing import Any
 
+from evalkit.grading import GRADER_CONTEXTS, grade_response
 from evalkit.models import ScoreResult, Task, TaskResult
 from evalkit.providers import Provider
 from evalkit.rubrics import Rubric, load_prompts
@@ -81,6 +82,7 @@ def run_eval(
     repeats: int = DEFAULT_REPEATS,
     workers: int | None = None,
     rubrics: Mapping[str, Rubric] | None = None,
+    grader_context: str = "with_prompt",
 ) -> list[TaskResult]:
     """Score every task ``repeats`` times and return the attempts in task order.
 
@@ -103,6 +105,8 @@ def run_eval(
         raise ValueError("workers must be at least 1")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
+    if grader_context not in GRADER_CONTEXTS:
+        raise ValueError("grader context must be response_only or with_prompt")
 
     catalog = dict(rubrics or {})
     loaded = _coerce_tasks(tasks, catalog)
@@ -125,15 +129,11 @@ def run_eval(
                 judge=judge,
                 attempt=attempt,
                 rubrics=catalog,
+                grader_context=grader_context,
             )
             for attempt in range(1, repeats + 1)
         ]
-        if repeats > 1:
-            unstable = len({result.passed for result in attempts}) > 1
-            output_varies = len({result.output.strip() for result in attempts}) > 1
-            for result in attempts:
-                result.unstable = unstable
-                result.output_varies = output_varies
+        apply_stability_flags(attempts, repeats)
         return attempts
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -169,6 +169,7 @@ def _evaluate_task(
     judge: Provider | None,
     attempt: int,
     rubrics: Mapping[str, Rubric],
+    grader_context: str = "with_prompt",
 ) -> TaskResult:
     started = time.perf_counter()
     output = ""
@@ -180,7 +181,7 @@ def _evaluate_task(
             retries=retries,
             timeout=timeout,
         )
-        scored = _score_output(task, output, judge, rubrics)
+        scored = _score_output(task, output, judge, rubrics, grader_context=grader_context)
     except Exception as exc:  # noqa: BLE001 - one task must not abort the run
         output = ""
         scored = ScoreResult(score=0.0, passed=False, reason=f"provider failed: {exc}")
@@ -197,11 +198,29 @@ def _evaluate_task(
         reason=scored.reason,
         latency_ms=elapsed_ms,
         attempt=attempt,
-        failure_type=failure_type_for(output, scored.reason, passed=scored.passed),
+        failure_type=failure_for(scored, output),
         rubric_id=task.rubric_id,
         rubric_version=None if rubric is None else rubric.version,
         rubric_hash=None if rubric is None else rubric.content_hash,
     )
+
+
+def apply_stability_flags(attempts: list[TaskResult], repeats: int) -> None:
+    """Mark attempts that disagree. A single attempt is left unflagged."""
+    if repeats <= 1:
+        return
+    unstable = len({result.passed for result in attempts}) > 1
+    output_varies = len({result.output.strip() for result in attempts}) > 1
+    for result in attempts:
+        result.unstable = unstable
+        result.output_varies = output_varies
+
+
+def failure_for(scored: ScoreResult, output: str) -> str | None:
+    """Use a grader-assigned failure when one was set, otherwise label the attempt."""
+    if scored.forced_failure:
+        return scored.forced_failure
+    return failure_type_for(output, scored.reason, passed=scored.passed)
 
 
 def failure_type_for(output: str, reason: str, *, passed: bool) -> str | None:
@@ -250,7 +269,7 @@ def _generate_once(provider: Provider, prompt: str, task_id: str, timeout: float
     def target() -> None:
         try:
             box["value"] = provider.generate(prompt, task_id=task_id)
-        except Exception as exc:  # noqa: BLE001 - return the error to the caller thread
+        except BaseException as exc:  # noqa: BLE001 - return the error, including Ctrl+C
             box["error"] = exc
 
     worker = Thread(target=target, daemon=True)
@@ -260,7 +279,7 @@ def _generate_once(provider: Provider, prompt: str, task_id: str, timeout: float
         raise TimeoutError(f"timed out after {timeout:g} seconds")
     if "error" in box:
         error = box["error"]
-        if isinstance(error, Exception):
+        if isinstance(error, BaseException):
             raise error
         raise RuntimeError(str(error))
     value = box.get("value")
@@ -274,9 +293,11 @@ def _score_output(
     output: str,
     judge: Provider | None,
     rubrics: Mapping[str, Rubric],
+    *,
+    grader_context: str = "with_prompt",
 ) -> ScoreResult:
     if task.rubric_id:
-        return _score_with_rubric(task, output, judge, rubrics)
+        return _score_with_rubric(task, output, judge, rubrics, grader_context=grader_context)
     scorer_name = task.scorer or ""
     scorer = SCORERS.get(scorer_name)
     if scorer is None:
@@ -304,18 +325,18 @@ def _score_with_rubric(
     output: str,
     judge: Provider | None,
     rubrics: Mapping[str, Rubric],
+    *,
+    grader_context: str = "with_prompt",
 ) -> ScoreResult:
     rubric = rubrics.get(task.rubric_id or "")
     if rubric is None:
         return ScoreResult(score=0.0, passed=False, reason=f"unknown rubric: {task.rubric_id}")
     if judge is None:
         return ScoreResult(score=0.0, passed=False, reason="llm_judge requires a judge provider")
-    try:
-        scored = llm_judge(output, rubric.render(), prompt=task.prompt, judge=judge)
-    except Exception as exc:  # noqa: BLE001 - a scorer bug should be a failed score
-        return ScoreResult(score=0.0, passed=False, reason=f"scorer failed: {exc}")
-    return ScoreResult(
-        score=scored.score,
-        passed=scored.score >= rubric.pass_threshold,
-        reason=scored.reason,
+    return grade_response(
+        rubric,
+        output,
+        task.prompt,
+        judge,
+        context=grader_context,
     )

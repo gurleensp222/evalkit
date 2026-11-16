@@ -9,11 +9,19 @@ from uuid import uuid4
 import pandas as pd
 import typer
 
+from evalkit.agents import load_agents, resolve_agents
 from evalkit.models import TaskResult
+from evalkit.pipeline import answer_run, grade_run
 from evalkit.providers import ProviderError, create_judge_provider, create_provider
-from evalkit.rubrics import Rubric, lint_rubrics, load_prompts, load_rubrics
-from evalkit.runner import run_eval
-from evalkit.storage import load_results, save_results
+from evalkit.rubrics import Rubric, lint_rubrics, load_rubrics
+from evalkit.storage import (
+    DATABASE_NAME,
+    DEFAULT_RUNS_DIR,
+    StoredCriterionGrade,
+    load_criterion_grades,
+    load_results,
+    load_run,
+)
 
 app = typer.Typer(help="Run model evaluations and report the scores.", no_args_is_help=True)
 
@@ -23,9 +31,9 @@ DATASET_OPTION = typer.Option(
     help="JSONL file of tasks.",
 )
 PROVIDER_OPTION = typer.Option(
-    "mock",
+    None,
     "--provider",
-    help="mock, ollama, openai, or anthropic.",
+    help="Overrides agents.yaml. Defaults to mock.",
 )
 RUN_ID_OPTION = typer.Option(
     None,
@@ -75,6 +83,73 @@ STRICT_OPTION = typer.Option(
     help="Exit with code 1 when lint finds a warning.",
 )
 DEFAULT_RUBRICS = Path("datasets/rubrics")
+ANSWER_DATASET_OPTION = typer.Option(
+    Path("datasets/sample_tasks.jsonl"),
+    "--dataset",
+    help="JSONL file or directory of prompts.",
+)
+ANSWER_PROVIDER_OPTION = typer.Option(
+    "mock",
+    "--provider",
+    help="mock, ollama, openai, or anthropic.",
+)
+ANSWER_RUN_ID_OPTION = typer.Option(
+    None,
+    "--run-id",
+    help="Id used for this run in runs/evalkit.db.",
+)
+ANSWER_WORKERS_OPTION = typer.Option(
+    None,
+    "--workers",
+    min=1,
+    help="How many tasks to run at once. Ollama uses 1 unless this is set.",
+)
+ANSWER_MODEL_OPTION = typer.Option(
+    None,
+    "--model",
+    help="Model id. Ollama defaults to llama3.2.",
+)
+ANSWER_TEMPERATURE_OPTION = typer.Option(
+    None,
+    "--temperature",
+    help="Sampling temperature for Ollama.",
+)
+ANSWER_ATTEMPTS_OPTION = typer.Option(
+    3,
+    "--attempts",
+    min=1,
+    help="How many times to run each task.",
+)
+RESUME_OPTION = typer.Option(
+    None,
+    "--resume",
+    help="Continue a run and skip answers that are already saved.",
+)
+GRADE_JUDGE_PROVIDER_OPTION = typer.Option(
+    None,
+    "--judge-provider",
+    help="Provider that grades rubric tasks. Uses temperature 0 and JSON output.",
+)
+GRADE_JUDGE_MODEL_OPTION = typer.Option(
+    None,
+    "--judge-model",
+    help="Model id for the judge.",
+)
+CONFIG_OPTION = typer.Option(
+    None,
+    "--config",
+    help="YAML file with answer_agent and grader_agent.",
+)
+GRADER_CONTEXT_OPTION = typer.Option(
+    "with_prompt",
+    "--grader-context",
+    help="response_only sends the response and rubric. with_prompt also sends the task.",
+)
+GRADE_CONTEXT_OPTION = typer.Option(
+    "with_prompt",
+    "--grader-context",
+    help="response_only sends the response and rubric. with_prompt also sends the task.",
+)
 
 rubrics_app = typer.Typer(help="List, validate, and lint rubric files.", no_args_is_help=True)
 app.add_typer(rubrics_app, name="rubrics")
@@ -83,7 +158,7 @@ app.add_typer(rubrics_app, name="rubrics")
 @app.command()
 def run(
     dataset: Path = DATASET_OPTION,
-    provider: str = PROVIDER_OPTION,
+    provider: str | None = PROVIDER_OPTION,
     run_id: str | None = RUN_ID_OPTION,
     workers: int | None = WORKERS_OPTION,
     model: str | None = MODEL_OPTION,
@@ -91,35 +166,150 @@ def run(
     judge_provider: str | None = JUDGE_PROVIDER_OPTION,
     judge_model: str | None = JUDGE_MODEL_OPTION,
     attempts: int = ATTEMPTS_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    grader_context: str = GRADER_CONTEXT_OPTION,
 ) -> None:
-    """Run every task in a dataset and save the scores."""
+    """Answer every task, then grade the saved answers."""
     if not dataset.exists():
         typer.echo(f"dataset not found: {dataset}", err=True)
         raise typer.Exit(1)
+    chosen_id = run_id or _new_run_id()
     try:
+        context = _grader_context(grader_context)
+        agents = load_agents(config) if config else None
+        resolved = resolve_agents(
+            agents,
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            judge_provider=judge_provider,
+            judge_model=judge_model,
+        )
         catalog = _catalog_or_empty(DEFAULT_RUBRICS)
-        prompts = load_prompts(dataset, catalog)
-        selected = create_provider(provider, model=model, temperature=temperature)
-        judge = None
-        if judge_provider:
-            judge = create_judge_provider(judge_provider, model=judge_model)
-        chosen_id = run_id or _new_run_id()
-        results = run_eval(
-            prompts,
+        selected = create_provider(resolved.provider, **_provider_kwargs(resolved))
+        answer_run(
+            dataset,
             selected,
             chosen_id,
+            attempts=attempts,
             workers=workers,
-            judge=judge,
             rubrics=catalog,
-            repeats=attempts,
+            temperature=resolved.temperature,
+            provider_name=resolved.provider,
+            on_progress=typer.echo,
         )
+        judge = None
+        if resolved.judge_provider:
+            judge = create_judge_provider(
+                resolved.judge_provider,
+                **_judge_kwargs(resolved),
+            )
+        grade_run(
+            chosen_id,
+            judge=judge,
+            judge_model=resolved.judge_model,
+            rubrics=catalog,
+            on_progress=typer.echo,
+            grader_context=context,
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
     except (ProviderError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
 
-    path = save_results(chosen_id, results, attempts=attempts)
+    results = load_results(chosen_id)
     _print_summary(chosen_id, results)
-    typer.echo(f"saved {path}")
+    typer.echo(f"saved {DEFAULT_RUNS_DIR / DATABASE_NAME}")
+
+
+@app.command()
+def answer(
+    dataset: Path = ANSWER_DATASET_OPTION,
+    provider: str = ANSWER_PROVIDER_OPTION,
+    run_id: str | None = ANSWER_RUN_ID_OPTION,
+    workers: int | None = ANSWER_WORKERS_OPTION,
+    model: str | None = ANSWER_MODEL_OPTION,
+    temperature: float | None = ANSWER_TEMPERATURE_OPTION,
+    attempts: int = ANSWER_ATTEMPTS_OPTION,
+    resume: str | None = RESUME_OPTION,
+) -> None:
+    """Generate answers and save each one as soon as it finishes."""
+    chosen_id = resume or run_id or _new_run_id()
+    try:
+        catalog = _catalog_or_empty(DEFAULT_RUBRICS)
+        if resume:
+            stored = load_run(resume)
+            if stored is None or not stored.provider:
+                raise FileNotFoundError(resume)
+            selected = create_provider(
+                stored.provider,
+                model=stored.model,
+                temperature=stored.temperature,
+            )
+            answer_run(
+                stored.dataset,
+                selected,
+                resume,
+                resume=True,
+                workers=workers,
+                rubrics=catalog,
+                on_progress=typer.echo,
+            )
+        else:
+            if not dataset.exists():
+                typer.echo(f"dataset not found: {dataset}", err=True)
+                raise typer.Exit(1)
+            selected = create_provider(provider, model=model, temperature=temperature)
+            answer_run(
+                dataset,
+                selected,
+                chosen_id,
+                attempts=attempts,
+                workers=workers,
+                rubrics=catalog,
+                temperature=temperature,
+                provider_name=provider,
+                on_progress=typer.echo,
+            )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ProviderError, ValueError, FileNotFoundError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"saved {DEFAULT_RUNS_DIR / DATABASE_NAME}")
+
+
+@app.command()
+def grade(
+    run_id: str,
+    judge_provider: str | None = GRADE_JUDGE_PROVIDER_OPTION,
+    judge_model: str | None = GRADE_JUDGE_MODEL_OPTION,
+    grader_context: str = GRADE_CONTEXT_OPTION,
+) -> None:
+    """Score the answers saved for a run. A new judge is stored beside older ones."""
+    try:
+        context = _grader_context(grader_context)
+        catalog = _catalog_or_empty(DEFAULT_RUBRICS)
+        judge = None
+        if judge_provider:
+            judge = create_judge_provider(judge_provider, model=judge_model)
+        grade_run(
+            run_id,
+            judge=judge,
+            judge_model=judge_model,
+            rubrics=catalog,
+            on_progress=typer.echo,
+            grader_context=context,
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ProviderError, ValueError, FileNotFoundError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    results = load_results(run_id, judge=judge_model)
+    _print_summary(run_id, results)
+    typer.echo(f"saved {DEFAULT_RUNS_DIR / DATABASE_NAME}")
 
 
 @app.command()
@@ -134,6 +324,7 @@ def report(run_id: str) -> None:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
     _print_summary(run_id, results)
+    _print_criteria(run_id, results)
 
 
 @app.command()
@@ -204,6 +395,82 @@ def _catalog_or_empty(directory: Path) -> dict[str, Rubric]:
     if not directory.is_dir():
         return {}
     return load_rubrics(directory)
+
+
+def _provider_kwargs(resolved: object) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "model": getattr(resolved, "model", None),
+        "temperature": getattr(resolved, "temperature", None),
+    }
+    system = getattr(resolved, "system_prompt", None)
+    if isinstance(system, str) and system.strip():
+        kwargs["system"] = system
+    return kwargs
+
+
+def _judge_kwargs(resolved: object) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "model": getattr(resolved, "judge_model", None),
+        "temperature": getattr(resolved, "judge_temperature", 0),
+    }
+    system = getattr(resolved, "judge_system_prompt", None)
+    if isinstance(system, str) and system.strip():
+        kwargs["system"] = system
+    return kwargs
+
+
+def _grader_context(value: str) -> str:
+    if value not in {"response_only", "with_prompt"}:
+        raise ValueError("grader context must be response_only or with_prompt")
+    return value
+
+
+def _print_criteria(run_id: str, results: list[TaskResult]) -> None:
+    critical = [
+        result
+        for result in results
+        if isinstance(result.failure_type, str) and result.failure_type.startswith("critical:")
+    ]
+    judge = ""
+    if results and results[0].judge:
+        judge = results[0].judge
+    grades = load_criterion_grades(run_id, judge=judge) if results else []
+    if not grades and not critical:
+        return
+    if grades:
+        typer.echo("")
+        typer.echo("criteria")
+        typer.echo(_criterion_table(results, grades))
+    typer.echo("")
+    typer.echo("critical failures")
+    if not critical:
+        typer.echo("none")
+        return
+    for result in critical:
+        typer.echo(
+            f"{result.task_id}  attempt {result.attempt}  {result.model}  {result.failure_type}"
+        )
+
+
+def _criterion_table(results: list[TaskResult], grades: list[StoredCriterionGrade]) -> str:
+    """Met rate for each criterion, split by the model that wrote the answer."""
+    model_of = {(result.task_id, result.attempt): result.model for result in results}
+    frame = pd.DataFrame(
+        [
+            {
+                "criterion": grade.criterion_id,
+                "model": model_of.get((grade.task_id, grade.attempt), ""),
+                "met": 1.0 if grade.met else 0.0,
+            }
+            for grade in grades
+        ]
+    )
+    rates = frame.pivot_table(index="criterion", columns="model", values="met", aggfunc="mean")
+    order = list(dict.fromkeys(grade.criterion_id for grade in grades))
+    rates = rates.reindex(order)
+    rates.index.name = "criterion"
+    with pd.option_context("display.max_colwidth", None, "display.max_rows", None):
+        return rates.to_string(float_format=lambda value: f"{float(value):.2f}")
 
 
 def _new_run_id() -> str:

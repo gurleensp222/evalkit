@@ -166,6 +166,7 @@ class OpenAIProvider:
         client: httpx.Client | None = None,
         temperature: float | None = None,
         json_format: bool = False,
+        system: str | None = None,
     ) -> None:
         if not api_key.strip():
             raise ProviderError("OPENAI_API_KEY is not set")
@@ -174,6 +175,7 @@ class OpenAIProvider:
         self.model = model
         self.temperature = temperature
         self.json_format = json_format
+        self.system = system.strip() if isinstance(system, str) and system.strip() else None
         self._client = client
 
     def generate(
@@ -186,7 +188,7 @@ class OpenAIProvider:
         del task_id
         payload: dict[str, object] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": _chat_messages(prompt, self.system),
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
@@ -218,6 +220,7 @@ class AnthropicProvider:
         client: httpx.Client | None = None,
         temperature: float | None = None,
         json_format: bool = False,
+        system: str | None = None,
     ) -> None:
         if not api_key.strip():
             raise ProviderError("ANTHROPIC_API_KEY is not set")
@@ -227,6 +230,7 @@ class AnthropicProvider:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.json_format = json_format
+        self.system = system.strip() if isinstance(system, str) and system.strip() else None
         self._client = client
 
     def generate(
@@ -244,6 +248,8 @@ class AnthropicProvider:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if self.system:
+            payload["system"] = self.system
         body = _post(
             self._client,
             ANTHROPIC_URL,
@@ -268,6 +274,7 @@ def create_openai_provider(
     model: str | None = None,
     temperature: float | None = None,
     json_format: bool = False,
+    system: str | None = None,
 ) -> OpenAIProvider | None:
     """Build an OpenAI provider only when ``OPENAI_API_KEY`` is set."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -279,8 +286,9 @@ def create_openai_provider(
             model=model,
             temperature=temperature,
             json_format=json_format,
+            system=system,
         )
-    return OpenAIProvider(api_key, temperature=temperature, json_format=json_format)
+    return OpenAIProvider(api_key, temperature=temperature, json_format=json_format, system=system)
 
 
 def create_anthropic_provider(
@@ -288,6 +296,7 @@ def create_anthropic_provider(
     model: str | None = None,
     temperature: float | None = None,
     json_format: bool = False,
+    system: str | None = None,
 ) -> AnthropicProvider | None:
     """Build an Anthropic provider only when ``ANTHROPIC_API_KEY`` is set."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -299,13 +308,26 @@ def create_anthropic_provider(
             model=model,
             temperature=temperature,
             json_format=json_format,
+            system=system,
         )
-    return AnthropicProvider(api_key, temperature=temperature, json_format=json_format)
+    return AnthropicProvider(api_key, temperature=temperature, json_format=json_format, system=system)
 
 
-def create_judge_provider(name: str, *, model: str | None = None) -> Provider:
+def create_judge_provider(
+    name: str,
+    *,
+    model: str | None = None,
+    temperature: float | None = 0,
+    system: str | None = None,
+) -> Provider:
     """Build a judge. It samples at temperature 0 and asks for JSON."""
-    return create_provider(name, model=model, temperature=0, json_format=True)
+    return create_provider(
+        name,
+        model=model,
+        temperature=temperature,
+        system=system,
+        json_format=True,
+    )
 
 
 def create_provider(
@@ -336,6 +358,7 @@ def create_provider(
             model=chosen or None,
             temperature=temperature,
             json_format=json_format,
+            system=system,
         )
         if provider is None:
             raise ProviderError("OPENAI_API_KEY is not set")
@@ -345,6 +368,7 @@ def create_provider(
             model=chosen or None,
             temperature=temperature,
             json_format=json_format,
+            system=system,
         )
         if provider is None:
             raise ProviderError("ANTHROPIC_API_KEY is not set")

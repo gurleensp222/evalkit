@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -202,7 +203,14 @@ def test_rubric_task_is_scored_by_a_mock_judge_and_saved(tmp_path: Path) -> None
             del task_id, timeout
             assert "answers_question" in prompt
             assert "30 days" in prompt
-            return '{"score": 5, "reason": "meets the rubric"}'
+            return json.dumps(
+                {
+                    "criteria": [
+                        {"id": criterion.id, "met": True, "reason": "met"}
+                        for criterion in rubrics["helpful_answer_v1"].criteria
+                    ]
+                }
+            )
 
     results = run_eval(
         [task],
@@ -216,7 +224,7 @@ def test_rubric_task_is_scored_by_a_mock_judge_and_saved(tmp_path: Path) -> None
     rubric = rubrics["helpful_answer_v1"]
     assert results[0].passed is True
     assert results[0].score == 1.0
-    assert results[0].reason == "meets the rubric"
+    assert results[0].reason == "all criteria met"
     assert results[0].rubric_id == "helpful_answer_v1"
     assert results[0].rubric_version == rubric.version
     assert results[0].rubric_hash == rubric.content_hash
@@ -249,7 +257,21 @@ def test_rubric_pass_threshold_overrides_the_judge_default() -> None:
             timeout: float | None = None,
         ) -> str:
             del prompt, task_id, timeout
-            return '{"score": 3, "reason": "partial"}'
+            met = {
+                "answers_question": False,
+                "no_invented_policy": True,
+                "actionable_next_step": False,
+                "plain_language": True,
+                "no_sensitive_data_request": True,
+            }
+            return json.dumps(
+                {
+                    "criteria": [
+                        {"id": criterion_id, "met": flag, "reason": "checked"}
+                        for criterion_id, flag in met.items()
+                    ]
+                }
+            )
 
     results = run_eval(
         [task],

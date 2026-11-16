@@ -4,8 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from evalkit.api import create_app
-from evalkit.models import TaskResult
 from evalkit.providers import ProviderError
+from evalkit.storage import load_results, upsert_run
 
 TASKS = """\
 {"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "4"}
@@ -45,18 +45,22 @@ def test_mock_run_summary_and_failures(client: TestClient, dataset: Path) -> Non
     created = client.post("/runs", json={"provider": "mock", "dataset": str(dataset)})
     assert created.status_code == 202
     run_id = created.json()["run_id"]
-    assert created.json()["status"] == "running"
+    assert created.json()["status"] == "answering"
 
     listed = client.get("/runs")
     assert listed.status_code == 200
     match = next(item for item in listed.json() if item["run_id"] == run_id)
-    assert match["status"] == "completed"
+    assert match["status"] == "graded"
     assert match["provider"] == "mock"
 
     detail = client.get(f"/runs/{run_id}")
     assert detail.status_code == 200
     body = detail.json()
-    assert body["status"] == "completed"
+    assert body["status"] == "graded"
+    assert body["answers_done"] == 6
+    assert body["answers_expected"] == 6
+    assert body["grades_done"] == 6
+    assert body["grades_expected"] == 6
     assert body["summary"] == [
         {
             "model": "mock",
@@ -154,18 +158,17 @@ def test_post_runs_forwards_model_temperature_and_workers(
 
         return Selected()
 
-    def run(
-        tasks: object,
-        provider: object,
-        run_id: str,
-        **kwargs: object,
-    ) -> list[TaskResult]:
-        del tasks, provider, run_id
-        seen.append(("run", kwargs))
-        return []
+    def answer_run(*args: object, **kwargs: object) -> None:
+        del args
+        seen.append(("answer", kwargs))
+
+    def grade_run(*args: object, **kwargs: object) -> None:
+        del args
+        seen.append(("grade", kwargs))
 
     monkeypatch.setattr("evalkit.api.create_provider", create)
-    monkeypatch.setattr("evalkit.api.run_eval", run)
+    monkeypatch.setattr("evalkit.api.answer_run", answer_run)
+    monkeypatch.setattr("evalkit.api.grade_run", grade_run)
     response = client.post(
         "/runs",
         json={
@@ -179,17 +182,17 @@ def test_post_runs_forwards_model_temperature_and_workers(
     assert response.status_code == 202
     creates = [item for item in seen if item[0] == "create"]
     assert creates[0][2] == {"model": "llama3.1", "temperature": 0.4}
-    run_calls = [item for item in seen if item[0] == "run"]
-    assert run_calls[0][1]["workers"] == 2
-    assert run_calls[0][1]["repeats"] == 3
+    answer_calls = [item for item in seen if item[0] == "answer"]
+    assert answer_calls[0][1]["workers"] == 2
+    assert answer_calls[0][1]["attempts"] == 3
 
     once = client.post(
         "/runs",
         json={"provider": "mock", "dataset": str(dataset), "attempts": 1},
     )
     assert once.status_code == 202
-    run_calls = [item for item in seen if item[0] == "run"]
-    assert run_calls[-1][1]["repeats"] == 1
+    answer_calls = [item for item in seen if item[0] == "answer"]
+    assert answer_calls[-1][1]["attempts"] == 1
 
     rejected = client.post(
         "/runs",
@@ -221,6 +224,49 @@ def test_post_runs_rejects_a_missing_ollama_model(
     assert response.json()["detail"] == "run: ollama pull llama3.2"
 
 
+def test_grade_keeps_a_second_judge_and_reports_progress(
+    client: TestClient,
+    dataset: Path,
+) -> None:
+    created = client.post(
+        "/runs",
+        json={"provider": "mock", "dataset": str(dataset), "attempts": 1},
+    )
+    run_id = created.json()["run_id"]
+    graded = client.post(
+        f"/runs/{run_id}/grade",
+        json={"judge_provider": "mock", "judge_model": "beta"},
+    )
+    assert graded.status_code == 202
+    assert graded.json()["status"] == "grading"
+
+    directory = dataset.parent / "runs"
+    original = load_results(run_id, directory=directory, judge="")
+    second = load_results(run_id, directory=directory, judge="beta")
+    assert len(original) == 2
+    assert [(item.task_id, item.score) for item in second] == [
+        (item.task_id, item.score) for item in original
+    ]
+    detail = client.get(f"/runs/{run_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "graded"
+    assert detail.json()["grades_done"] == 2
+
+    missing = client.post("/runs/missing/grade", json={})
+    assert missing.status_code == 404
+    upsert_run(
+        "stuck",
+        directory=directory,
+        status="answering",
+        provider="mock",
+        dataset=str(dataset),
+        attempts=1,
+        task_count=1,
+    )
+    busy = client.post("/runs/stuck/grade", json={})
+    assert busy.status_code == 409
+
+
 def test_openapi_names_the_response_models(client: TestClient) -> None:
     schema = client.get("/openapi.json")
     assert schema.status_code == 200
@@ -230,6 +276,7 @@ def test_openapi_names_the_response_models(client: TestClient) -> None:
         "/tasks",
         "/runs",
         "/runs/{run_id}",
+        "/runs/{run_id}/grade",
         "/runs/{run_id}/failures",
         "/compare",
     } <= set(body["paths"])

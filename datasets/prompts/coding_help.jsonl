@@ -1,0 +1,5 @@
+{"id": "explain-decorator", "category": "coding", "prompt": "Explain what a Python decorator does, using a tiny example.", "rubric_id": "code_explanation_v1"}
+{"id": "explain-list-comprehension", "category": "coding", "prompt": "Explain a Python list comprehension and show the same loop written out.", "rubric_id": "code_explanation_v1"}
+{"id": "explain-git-rebase", "category": "coding", "prompt": "Explain what git rebase does to commits, and when not to use it on a shared branch.", "rubric_id": "code_explanation_v1"}
+{"id": "explain-sql-join", "category": "coding", "prompt": "Explain an SQL inner join versus a left join with a two-table example.", "rubric_id": "code_explanation_v1"}
+{"id": "explain-async-await", "category": "coding", "prompt": "Explain async and await in Python, and how that differs from running a function directly.", "rubric_id": "code_explanation_v1"}

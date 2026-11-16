@@ -1,0 +1,20 @@
+id: code_explanation_v1
+version: 1
+description: An explanation of code or a programming idea is correct, clear, and complete enough to use.
+pass_threshold: 0.6
+criteria:
+  - id: correctness
+    weight: 0.5
+    description: The explanation matches how the language or tool actually behaves.
+    levels:
+      1: The explanation is wrong.
+      2: A central point is wrong.
+      3: The main idea is right, with a side mistake.
+      4: Correct, with a minor omission.
+      5: Correct and precise.
+  - id: clarity
+    weight: 0.3
+    description: A reader can follow the explanation without already knowing the answer.
+  - id: completeness
+    weight: 0.2
+    description: The explanation covers the question that was asked, including an example when one is needed.

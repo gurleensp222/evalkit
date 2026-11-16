@@ -10,7 +10,8 @@ import pandas as pd
 import typer
 
 from evalkit.models import TaskResult
-from evalkit.providers import ProviderError, create_provider
+from evalkit.providers import ProviderError, create_judge_provider, create_provider
+from evalkit.rubrics import Rubric, load_prompts, load_rubrics
 from evalkit.runner import run_eval
 from evalkit.storage import load_results, save_results
 
@@ -47,6 +48,31 @@ TEMPERATURE_OPTION = typer.Option(
     "--temperature",
     help="Sampling temperature for Ollama.",
 )
+JUDGE_PROVIDER_OPTION = typer.Option(
+    None,
+    "--judge-provider",
+    help="Provider that grades rubric tasks. Uses temperature 0 and JSON output.",
+)
+JUDGE_MODEL_OPTION = typer.Option(
+    None,
+    "--judge-model",
+    help="Model id for the judge.",
+)
+ATTEMPTS_OPTION = typer.Option(
+    3,
+    "--attempts",
+    min=1,
+    help="How many times to run each task.",
+)
+RUBRICS_OPTION = typer.Option(
+    Path("datasets/rubrics"),
+    "--directory",
+    help="Folder of YAML rubrics.",
+)
+DEFAULT_RUBRICS = Path("datasets/rubrics")
+
+rubrics_app = typer.Typer(help="List and validate rubric files.", no_args_is_help=True)
+app.add_typer(rubrics_app, name="rubrics")
 
 
 @app.command()
@@ -57,20 +83,36 @@ def run(
     workers: int | None = WORKERS_OPTION,
     model: str | None = MODEL_OPTION,
     temperature: float | None = TEMPERATURE_OPTION,
+    judge_provider: str | None = JUDGE_PROVIDER_OPTION,
+    judge_model: str | None = JUDGE_MODEL_OPTION,
+    attempts: int = ATTEMPTS_OPTION,
 ) -> None:
     """Run every task in a dataset and save the scores."""
-    if not dataset.is_file():
+    if not dataset.exists():
         typer.echo(f"dataset not found: {dataset}", err=True)
         raise typer.Exit(1)
     try:
+        catalog = _catalog_or_empty(DEFAULT_RUBRICS)
+        prompts = load_prompts(dataset, catalog)
         selected = create_provider(provider, model=model, temperature=temperature)
+        judge = None
+        if judge_provider:
+            judge = create_judge_provider(judge_provider, model=judge_model)
         chosen_id = run_id or _new_run_id()
-        results = run_eval(dataset, selected, chosen_id, workers=workers)
-    except ProviderError as exc:
+        results = run_eval(
+            prompts,
+            selected,
+            chosen_id,
+            workers=workers,
+            judge=judge,
+            rubrics=catalog,
+            repeats=attempts,
+        )
+    except (ProviderError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
 
-    path = save_results(chosen_id, results)
+    path = save_results(chosen_id, results, attempts=attempts)
     _print_summary(chosen_id, results)
     typer.echo(f"saved {path}")
 
@@ -111,6 +153,38 @@ def show(run_id: str, task_id: str) -> None:
         typer.echo("output:")
         typer.echo(result.output)
         typer.echo("")
+
+
+@rubrics_app.command("list")
+def list_rubrics(directory: Path = RUBRICS_OPTION) -> None:
+    """Print each rubric id, version, pass threshold, and content hash."""
+    catalog = _require_rubrics(directory)
+    for rubric in catalog.values():
+        typer.echo(
+            f"{rubric.id}  v{rubric.version}  threshold {rubric.pass_threshold:.2f}  "
+            f"{rubric.content_hash[:12]}"
+        )
+
+
+@rubrics_app.command("validate")
+def validate_rubrics(directory: Path = RUBRICS_OPTION) -> None:
+    """Check every rubric file and print how many loaded."""
+    catalog = _require_rubrics(directory)
+    typer.echo(f"{len(catalog)} rubrics ok")
+
+
+def _require_rubrics(directory: Path) -> dict[str, Rubric]:
+    try:
+        return load_rubrics(directory)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+def _catalog_or_empty(directory: Path) -> dict[str, Rubric]:
+    if not directory.is_dir():
+        return {}
+    return load_rubrics(directory)
 
 
 def _new_run_id() -> str:

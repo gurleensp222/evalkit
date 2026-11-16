@@ -11,6 +11,7 @@ from typing import Any
 
 from evalkit.models import ScoreResult, Task, TaskResult
 from evalkit.providers import Provider
+from evalkit.rubrics import Rubric, load_prompts
 from evalkit.scorers import SCORERS, llm_judge
 
 MAX_WORKERS = 4
@@ -79,13 +80,16 @@ def run_eval(
     judge: Provider | None = None,
     repeats: int = DEFAULT_REPEATS,
     workers: int | None = None,
+    rubrics: Mapping[str, Rubric] | None = None,
 ) -> list[TaskResult]:
     """Score every task ``repeats`` times and return the attempts in task order.
 
     A task is unstable when its attempts disagree on ``passed``. ``output_varies``
-    is set when the answer text differs. ``judge`` grades ``llm_judge`` tasks.
-    Ollama defaults to one worker and a 120 second HTTP timeout. A provider with
-    ``check_model_available`` is checked before any task runs.
+    is set when the answer text differs. A single attempt skips both checks.
+    ``judge`` grades ``llm_judge`` tasks and
+    tasks that name a ``rubric_id``. Ollama defaults to one worker and a 120 second
+    HTTP timeout. A provider with ``check_model_available`` is checked before any
+    task runs. Unknown rubric ids fail while the prompts are loaded.
     """
     if timeout is None:
         timeout = float(getattr(provider, "default_timeout", DEFAULT_TIMEOUT_SECONDS))
@@ -100,8 +104,13 @@ def run_eval(
     if timeout <= 0:
         raise ValueError("timeout must be positive")
 
-    loaded = _coerce_tasks(tasks)
+    catalog = dict(rubrics or {})
+    loaded = _coerce_tasks(tasks, catalog)
+    if any(task.rubric_id for task in loaded) and judge is None:
+        raise ValueError("rubric tasks require a judge provider")
     ensure_model_available(provider)
+    if judge is not None:
+        ensure_model_available(judge)
     if not loaded:
         return []
 
@@ -115,14 +124,16 @@ def run_eval(
                 timeout=timeout,
                 judge=judge,
                 attempt=attempt,
+                rubrics=catalog,
             )
             for attempt in range(1, repeats + 1)
         ]
-        unstable = len({result.passed for result in attempts}) > 1
-        output_varies = len({result.output.strip() for result in attempts}) > 1
-        for result in attempts:
-            result.unstable = unstable
-            result.output_varies = output_varies
+        if repeats > 1:
+            unstable = len({result.passed for result in attempts}) > 1
+            output_varies = len({result.output.strip() for result in attempts}) > 1
+            for result in attempts:
+                result.unstable = unstable
+                result.output_varies = output_varies
         return attempts
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -130,15 +141,21 @@ def run_eval(
         return [result for attempts in grouped for result in attempts]
 
 
-def _coerce_tasks(tasks: str | Path | Sequence[Task | Mapping[str, Any]]) -> list[Task]:
+def _coerce_tasks(
+    tasks: str | Path | Sequence[Task | Mapping[str, Any]],
+    rubrics: Mapping[str, Rubric],
+) -> list[Task]:
     if isinstance(tasks, (str, Path)):
-        return load_tasks(tasks)
+        return load_prompts(tasks, rubrics)
     loaded: list[Task] = []
+    missing: list[str] = []
     for item in tasks:
-        if isinstance(item, Task):
-            loaded.append(item)
-        else:
-            loaded.append(Task.model_validate(item))
+        task = item if isinstance(item, Task) else Task.model_validate(item)
+        if task.rubric_id and task.rubric_id not in rubrics:
+            missing.append(task.id)
+        loaded.append(task)
+    if missing:
+        raise ValueError("unknown rubric_id for prompt ids: " + ", ".join(missing))
     return loaded
 
 
@@ -151,6 +168,7 @@ def _evaluate_task(
     timeout: float,
     judge: Provider | None,
     attempt: int,
+    rubrics: Mapping[str, Rubric],
 ) -> TaskResult:
     started = time.perf_counter()
     output = ""
@@ -162,11 +180,12 @@ def _evaluate_task(
             retries=retries,
             timeout=timeout,
         )
-        scored = _score_output(task, output, judge)
+        scored = _score_output(task, output, judge, rubrics)
     except Exception as exc:  # noqa: BLE001 - one task must not abort the run
         output = ""
         scored = ScoreResult(score=0.0, passed=False, reason=f"provider failed: {exc}")
     elapsed_ms = (time.perf_counter() - started) * 1000
+    rubric = rubrics.get(task.rubric_id) if task.rubric_id else None
     return TaskResult(
         run_id=run_id,
         task_id=task.id,
@@ -179,6 +198,9 @@ def _evaluate_task(
         latency_ms=elapsed_ms,
         attempt=attempt,
         failure_type=failure_type_for(output, scored.reason, passed=scored.passed),
+        rubric_id=task.rubric_id,
+        rubric_version=None if rubric is None else rubric.version,
+        rubric_hash=None if rubric is None else rubric.content_hash,
     )
 
 
@@ -247,8 +269,16 @@ def _generate_once(provider: Provider, prompt: str, task_id: str, timeout: float
     return value
 
 
-def _score_output(task: Task, output: str, judge: Provider | None) -> ScoreResult:
-    scorer = SCORERS.get(task.scorer)
+def _score_output(
+    task: Task,
+    output: str,
+    judge: Provider | None,
+    rubrics: Mapping[str, Rubric],
+) -> ScoreResult:
+    if task.rubric_id:
+        return _score_with_rubric(task, output, judge, rubrics)
+    scorer_name = task.scorer or ""
+    scorer = SCORERS.get(scorer_name)
     if scorer is None:
         return ScoreResult(
             score=0.0,
@@ -267,3 +297,25 @@ def _score_output(task: Task, output: str, judge: Provider | None) -> ScoreResul
         return scorer(output, task.expected)
     except Exception as exc:  # noqa: BLE001 - a scorer bug should be a failed score
         return ScoreResult(score=0.0, passed=False, reason=f"scorer failed: {exc}")
+
+
+def _score_with_rubric(
+    task: Task,
+    output: str,
+    judge: Provider | None,
+    rubrics: Mapping[str, Rubric],
+) -> ScoreResult:
+    rubric = rubrics.get(task.rubric_id or "")
+    if rubric is None:
+        return ScoreResult(score=0.0, passed=False, reason=f"unknown rubric: {task.rubric_id}")
+    if judge is None:
+        return ScoreResult(score=0.0, passed=False, reason="llm_judge requires a judge provider")
+    try:
+        scored = llm_judge(output, rubric.render(), prompt=task.prompt, judge=judge)
+    except Exception as exc:  # noqa: BLE001 - a scorer bug should be a failed score
+        return ScoreResult(score=0.0, passed=False, reason=f"scorer failed: {exc}")
+    return ScoreResult(
+        score=scored.score,
+        passed=scored.score >= rubric.pass_threshold,
+        reason=scored.reason,
+    )

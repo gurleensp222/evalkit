@@ -164,12 +164,16 @@ class OpenAIProvider:
         *,
         model: str = "gpt-4o-mini",
         client: httpx.Client | None = None,
+        temperature: float | None = None,
+        json_format: bool = False,
     ) -> None:
         if not api_key.strip():
             raise ProviderError("OPENAI_API_KEY is not set")
         self.name = "openai"
         self.api_key = api_key
         self.model = model
+        self.temperature = temperature
+        self.json_format = json_format
         self._client = client
 
     def generate(
@@ -180,13 +184,18 @@ class OpenAIProvider:
         timeout: float | None = None,
     ) -> str:
         del task_id
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.json_format:
+            payload["response_format"] = {"type": "json_object"}
         body = _post(
             self._client,
             OPENAI_URL,
-            payload={
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            payload=payload,
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=timeout,
         )
@@ -207,6 +216,8 @@ class AnthropicProvider:
         model: str = "claude-3-5-haiku-latest",
         max_tokens: int = 1024,
         client: httpx.Client | None = None,
+        temperature: float | None = None,
+        json_format: bool = False,
     ) -> None:
         if not api_key.strip():
             raise ProviderError("ANTHROPIC_API_KEY is not set")
@@ -214,6 +225,8 @@ class AnthropicProvider:
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.json_format = json_format
         self._client = client
 
     def generate(
@@ -224,14 +237,17 @@ class AnthropicProvider:
         timeout: float | None = None,
     ) -> str:
         del task_id
+        payload: dict[str, object] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         body = _post(
             self._client,
             ANTHROPIC_URL,
-            payload={
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            payload=payload,
             headers={
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
@@ -247,24 +263,49 @@ class AnthropicProvider:
         return "".join(texts)
 
 
-def create_openai_provider(*, model: str | None = None) -> OpenAIProvider | None:
+def create_openai_provider(
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    json_format: bool = False,
+) -> OpenAIProvider | None:
     """Build an OpenAI provider only when ``OPENAI_API_KEY`` is set."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
     if model:
-        return OpenAIProvider(api_key, model=model)
-    return OpenAIProvider(api_key)
+        return OpenAIProvider(
+            api_key,
+            model=model,
+            temperature=temperature,
+            json_format=json_format,
+        )
+    return OpenAIProvider(api_key, temperature=temperature, json_format=json_format)
 
 
-def create_anthropic_provider(*, model: str | None = None) -> AnthropicProvider | None:
+def create_anthropic_provider(
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    json_format: bool = False,
+) -> AnthropicProvider | None:
     """Build an Anthropic provider only when ``ANTHROPIC_API_KEY`` is set."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         return None
     if model:
-        return AnthropicProvider(api_key, model=model)
-    return AnthropicProvider(api_key)
+        return AnthropicProvider(
+            api_key,
+            model=model,
+            temperature=temperature,
+            json_format=json_format,
+        )
+    return AnthropicProvider(api_key, temperature=temperature, json_format=json_format)
+
+
+def create_judge_provider(name: str, *, model: str | None = None) -> Provider:
+    """Build a judge. It samples at temperature 0 and asks for JSON."""
+    return create_provider(name, model=model, temperature=0, json_format=True)
 
 
 def create_provider(
@@ -291,12 +332,20 @@ def create_provider(
             )
         )
     if normalized == "openai":
-        provider = create_openai_provider(model=chosen or None)
+        provider = create_openai_provider(
+            model=chosen or None,
+            temperature=temperature,
+            json_format=json_format,
+        )
         if provider is None:
             raise ProviderError("OPENAI_API_KEY is not set")
         return provider
     if normalized == "anthropic":
-        provider = create_anthropic_provider(model=chosen or None)
+        provider = create_anthropic_provider(
+            model=chosen or None,
+            temperature=temperature,
+            json_format=json_format,
+        )
         if provider is None:
             raise ProviderError("ANTHROPIC_API_KEY is not set")
         return provider

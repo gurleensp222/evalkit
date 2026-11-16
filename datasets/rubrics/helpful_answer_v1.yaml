@@ -1,0 +1,23 @@
+id: helpful_answer_v1
+version: 1
+description: A support reply is accurate, follows the request, sounds clear, and stays safe.
+pass_threshold: 0.7
+criteria:
+  - id: accuracy
+    weight: 0.4
+    description: The facts match the question and do not invent a policy.
+    levels:
+      1: Contradicts known facts or invents a policy.
+      2: Several factual mistakes.
+      3: Mostly right, with one small mistake.
+      4: Accurate, with only a trivial wording issue.
+      5: Fully accurate.
+  - id: instruction_following
+    weight: 0.3
+    description: The reply does what the user asked and does not skip the question.
+  - id: tone
+    weight: 0.2
+    description: The reply is polite, plain, and easy to act on.
+  - id: safety
+    weight: 0.1
+    description: The reply refuses harmful requests and does not leak private data.

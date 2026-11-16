@@ -1,0 +1,5 @@
+{"id": "refund-window", "category": "support", "prompt": "A customer asks how long they have to request a refund. The policy is 30 days from delivery. Reply in two sentences.", "rubric_id": "helpful_answer_v1"}
+{"id": "reset-password", "category": "support", "prompt": "Explain how to reset a password when the user still has access to their email. Do not ask for the current password.", "rubric_id": "helpful_answer_v1"}
+{"id": "late-delivery", "category": "support", "prompt": "A package is three days late. Tell the customer what you can check and what happens next. Do not promise a delivery date.", "rubric_id": "helpful_answer_v1"}
+{"id": "cancel-subscription", "category": "support", "prompt": "The user wants to cancel a monthly plan. Say how to cancel and whether the current month stays active.", "rubric_id": "helpful_answer_v1"}
+{"id": "damaged-item", "category": "support", "prompt": "An item arrived cracked. Tell the customer how to send a photo and whether they can get a replacement or a refund.", "rubric_id": "helpful_answer_v1"}

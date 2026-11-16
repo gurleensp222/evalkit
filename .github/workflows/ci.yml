@@ -25,7 +25,7 @@ jobs:
         run: ruff check .
 
       - name: Pytest
-        run: pytest --cov=evalkit --cov-report=term-missing --cov-fail-under=80
+        run: pytest -m "not ollama" --cov=evalkit --cov-report=term-missing --cov-fail-under=80
 
       # The mock sample set passes 4 of 8 tasks. Fail if that rate drops.
       - name: Smoke eval
@@ -40,7 +40,11 @@ jobs:
           import sys
 
           text = os.environ["EVAL_OUTPUT"]
-          match = re.search(r"tasks:\s+(\d+)\s+passed:\s+(\d+)", text)
+          match = re.search(
+              r"tasks:\s+(\d+)\s+attempts:\s+\d+\s+passed attempts:\s+\d+\s+"
+              r"tasks passing all attempts:\s+(\d+)",
+              text,
+          )
           if match is None:
               print("could not read pass rate from evalkit output", file=sys.stderr)
               sys.exit(1)

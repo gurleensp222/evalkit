@@ -4,10 +4,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from evalkit.api import create_app
+from evalkit.models import TaskResult
+from evalkit.providers import ProviderError
 
 TASKS = """\
-{"id": "exact-right", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "4"}
-{"id": "exact-wrong", "category": "knowledge", "prompt": "capital", "scorer": "exact_match", "expected": "Paris"}
+{"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "4"}
+{"id": "capital-of-france", "category": "knowledge", "prompt": "capital", "scorer": "exact_match", "expected": "Paris"}
 """
 
 
@@ -34,7 +36,7 @@ def test_list_tasks(client: TestClient) -> None:
     response = client.get("/tasks")
     assert response.status_code == 200
     body = response.json()
-    assert [task["id"] for task in body] == ["exact-right", "exact-wrong"]
+    assert [task["id"] for task in body] == ["two-plus-two", "capital-of-france"]
     assert body[0]["scorer"] == "exact_match"
     assert body[1]["expected"] == "Paris"
 
@@ -71,7 +73,11 @@ def test_mock_run_summary_and_failures(client: TestClient, dataset: Path) -> Non
     failed = client.get(f"/runs/{run_id}/failures")
     assert failed.status_code == 200
     reasons = failed.json()
-    assert [item["task_id"] for item in reasons] == ["exact-wrong", "exact-wrong", "exact-wrong"]
+    assert [item["task_id"] for item in reasons] == [
+        "capital-of-france",
+        "capital-of-france",
+        "capital-of-france",
+    ]
     assert reasons[0]["category"] == "knowledge"
     assert reasons[0]["failure_type"] == "wrong answer"
     assert "Paris" in reasons[0]["reason"]
@@ -131,6 +137,73 @@ def test_reject_unknown_provider_and_missing_dataset(client: TestClient, tmp_pat
         json={"provider": "mock", "dataset": str(tmp_path / "absent.jsonl")},
     )
     assert missing.status_code == 404
+
+
+def test_post_runs_forwards_model_temperature_and_workers(
+    client: TestClient,
+    dataset: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[object, ...]] = []
+
+    def create(name: str, **kwargs: object) -> object:
+        seen.append(("create", name, kwargs))
+
+        class Selected:
+            name = "mock"
+
+        return Selected()
+
+    def run(
+        tasks: object,
+        provider: object,
+        run_id: str,
+        **kwargs: object,
+    ) -> list[TaskResult]:
+        del tasks, provider, run_id
+        seen.append(("run", kwargs))
+        return []
+
+    monkeypatch.setattr("evalkit.api.create_provider", create)
+    monkeypatch.setattr("evalkit.api.run_eval", run)
+    response = client.post(
+        "/runs",
+        json={
+            "provider": "ollama",
+            "dataset": str(dataset),
+            "model": "llama3.1",
+            "temperature": 0.4,
+            "workers": 2,
+        },
+    )
+    assert response.status_code == 202
+    creates = [item for item in seen if item[0] == "create"]
+    assert creates[0][2] == {"model": "llama3.1", "temperature": 0.4}
+    assert ("run", {"workers": 2}) in seen
+
+    rejected = client.post(
+        "/runs",
+        json={"provider": "mock", "dataset": str(dataset), "workers": 0},
+    )
+    assert rejected.status_code == 422
+
+
+def test_post_runs_rejects_a_missing_ollama_model(
+    client: TestClient,
+    dataset: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Missing:
+        def check_model_available(self) -> None:
+            raise ProviderError("run: ollama pull llama3.2")
+
+    monkeypatch.setattr("evalkit.api.create_provider", lambda *args, **kwargs: Missing())
+    response = client.post(
+        "/runs",
+        json={"provider": "ollama", "dataset": str(dataset), "model": "llama3.2"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "run: ollama pull llama3.2"
 
 
 def test_openapi_names_the_response_models(client: TestClient) -> None:

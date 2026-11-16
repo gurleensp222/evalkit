@@ -24,6 +24,7 @@ RESULT_COLUMNS = [
     "latency_ms",
     "failure_type",
     "unstable",
+    "output_varies",
 ]
 FAILURE_COLUMNS = ["category", "task_id", "attempt", "model", "run_id", "score", "reason", "failure_type"]
 BOOTSTRAP_RESAMPLES = 1000

@@ -30,5 +30,11 @@ dashboard = [
 [project.scripts]
 evalkit = "evalkit.cli:app"
 
+[tool.pytest.ini_options]
+addopts = "-m 'not ollama'"
+markers = [
+    "ollama: live tests that call a local Ollama server",
+]
+
 [tool.setuptools.packages.find]
 include = ["evalkit*"]

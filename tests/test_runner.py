@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from evalkit.cli import _summary_table, app
 from evalkit.models import Task, TaskResult
 from evalkit.providers import (
+    AnthropicProvider,
     MockProvider,
     OllamaProvider,
     OpenAIProvider,
@@ -663,14 +664,22 @@ def test_cli_forwards_model_temperature_and_workers(
         seen["create"] = (name, kwargs)
         return MockProvider()
 
-    def run(tasks: object, provider: object, run_id: str, **kwargs: object) -> list[TaskResult]:
-        del tasks, provider
-        seen["run"] = kwargs
+    def answer_run(dataset: object, provider: object, run_id: str, **kwargs: object) -> None:
+        del dataset, provider
+        seen["answer"] = kwargs
+        from evalkit.storage import upsert_run
+
+        upsert_run(run_id, status="answered", model="mock", attempts=kwargs.get("attempts"))
+
+    def grade_run(run_id: str, **kwargs: object) -> list[TaskResult]:
+        del run_id
+        seen["grade"] = kwargs
         return []
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("evalkit.cli.create_provider", create)
-    monkeypatch.setattr("evalkit.cli.run_eval", run)
+    monkeypatch.setattr("evalkit.cli.answer_run", answer_run)
+    monkeypatch.setattr("evalkit.cli.grade_run", grade_run)
     completed = CLI.invoke(
         app,
         [
@@ -694,9 +703,9 @@ def test_cli_forwards_model_temperature_and_workers(
         "ollama",
         {"model": "llama3.1", "temperature": 0.2},
     )
-    assert seen["run"]["workers"] == 2
-    assert seen["run"]["judge"] is None
-    assert seen["run"]["repeats"] == 3
+    assert seen["answer"]["workers"] == 2
+    assert seen["answer"]["attempts"] == 3
+    assert seen["grade"]["judge"] is None
 
     once = CLI.invoke(
         app,
@@ -713,7 +722,7 @@ def test_cli_forwards_model_temperature_and_workers(
         ],
     )
     assert once.exit_code == 0
-    assert seen["run"]["repeats"] == 1
+    assert seen["answer"]["attempts"] == 1
 
     rejected = CLI.invoke(
         app,
@@ -798,3 +807,42 @@ def test_old_database_gains_a_model_column(tmp_path: Path) -> None:
     assert loaded[0].output_varies is False
     row = sqlite3.connect(database).execute("SELECT model FROM runs WHERE run_id = 'old'").fetchone()
     assert row == ("llama3.2",)
+
+
+def test_remote_providers_send_a_system_prompt() -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __init__(self, body: dict[str, object]) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._body
+
+    class Client:
+        def post(
+            self,
+            url: str,
+            json: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float | None = None,
+        ) -> Response:
+            del headers, timeout
+            captured["payload"] = json
+            if "openai" in url:
+                return Response({"choices": [{"message": {"content": "ok"}}]})
+            return Response({"content": [{"type": "text", "text": "ok"}]})
+
+    client = Client()
+    OpenAIProvider("key", client=client, system="be brief").generate("hi")
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["messages"][0] == {"role": "system", "content": "be brief"}
+
+    AnthropicProvider("key", client=client, system="be brief").generate("hi")
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["system"] == "be brief"

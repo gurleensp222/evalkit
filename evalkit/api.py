@@ -16,14 +16,29 @@ from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from evalkit.analysis import by_category, compare, failures, load_runs, summary
+from evalkit.pipeline import answer_run, grade_run
 from evalkit.providers import ProviderError, create_judge_provider, create_provider
 from evalkit.rubrics import Rubric, load_prompts, load_rubrics
-from evalkit.runner import ensure_model_available, run_eval
-from evalkit.storage import DEFAULT_RUNS_DIR, list_run_ids, load_results, save_results
+from evalkit.runner import ensure_model_available
+from evalkit.storage import (
+    DEFAULT_RUNS_DIR,
+    StoredRun,
+    list_run_ids,
+    load_run,
+    run_progress,
+    upsert_run,
+)
 
 DEFAULT_DATASET = Path("datasets/sample_tasks.jsonl")
 DEFAULT_RUBRICS = Path("datasets/rubrics")
-RunStatusName = Literal["running", "completed", "failed"]
+RunStatusName = Literal[
+    "answering",
+    "answered",
+    "grading",
+    "graded",
+    "interrupted",
+    "failed",
+]
 
 
 class HealthResponse(BaseModel):
@@ -79,11 +94,21 @@ class RunCreate(BaseModel):
     )
 
 
+class GradeCreate(BaseModel):
+    """Body for POST /runs/{run_id}/grade."""
+
+    judge_provider: str | None = Field(
+        default=None,
+        description="Provider that grades rubric tasks. Uses temperature 0 and JSON output.",
+    )
+    judge_model: str | None = Field(default=None, description="Model id for the judge.")
+
+
 class RunCreated(BaseModel):
-    """Accepted run. The evaluation continues in the background."""
+    """Accepted work. It continues in the background."""
 
     run_id: str
-    status: Literal["running"]
+    status: Literal["answering", "grading"]
 
 
 class RunInfo(BaseModel):
@@ -107,12 +132,16 @@ class ModelSummary(BaseModel):
 
 
 class RunDetail(BaseModel):
-    """Summary and per-category pass rates for a finished or in-progress run."""
+    """Summary, progress counts, and per-category pass rates."""
 
     run_id: str
     status: RunStatusName
     provider: str | None = None
     error: str | None = None
+    answers_done: int = 0
+    answers_expected: int = 0
+    grades_done: int = 0
+    grades_expected: int = 0
     summary: list[ModelSummary]
     by_category: dict[str, dict[str, float | None]] = Field(
         description="Pass rate by category (row) and model (column). Missing cells are null.",
@@ -223,12 +252,23 @@ def start_run(body: RunCreate, request: Request, background: BackgroundTasks) ->
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     run_id = uuid4().hex
+    provider_name = body.provider.strip().lower()
+    upsert_run(
+        run_id,
+        directory=Path(request.app.state.runs_directory),
+        status="answering",
+        provider=provider_name,
+        dataset=str(dataset),
+        attempts=body.attempts,
+        model=body.model,
+        temperature=body.temperature,
+    )
     _put_state(
         request.app,
         _RunState(
             run_id=run_id,
-            status="running",
-            provider=body.provider.strip().lower(),
+            status="answering",
+            provider=provider_name,
             dataset=str(dataset),
         ),
     )
@@ -245,25 +285,69 @@ def start_run(body: RunCreate, request: Request, background: BackgroundTasks) ->
         judge_model=body.judge_model,
         attempts=body.attempts,
     )
-    return RunCreated(run_id=run_id, status="running")
+    return RunCreated(run_id=run_id, status="answering")
+
+
+@router.post(
+    "/runs/{run_id}/grade",
+    response_model=RunCreated,
+    status_code=202,
+    responses={404: {"description": "Unknown run"}, 409: {"description": "Run is still in progress"}},
+)
+def start_grade(
+    run_id: str,
+    body: GradeCreate,
+    request: Request,
+    background: BackgroundTasks,
+) -> RunCreated:
+    """Grade saved answers in the background. Another judge is stored beside the first."""
+    directory = Path(request.app.state.runs_directory)
+    stored = _stored_or_http(run_id, directory)
+    if stored.status in {"answering", "grading"}:
+        raise HTTPException(status_code=409, detail=f"run {run_id} is still {stored.status}")
+    if body.judge_provider:
+        try:
+            ensure_model_available(
+                create_judge_provider(body.judge_provider, model=body.judge_model)
+            )
+        except ProviderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+    upsert_run(run_id, directory=directory, status="grading", error=None)
+    background.add_task(
+        _execute_grade,
+        request.app,
+        run_id,
+        body.judge_provider,
+        body.judge_model,
+    )
+    return RunCreated(run_id=run_id, status="grading")
 
 
 @router.get("/runs", response_model=list[RunInfo])
 def list_runs(request: Request) -> list[RunInfo]:
-    """List known run ids and whether each one is running, completed, or failed."""
+    """List known run ids and the status stored for each one."""
     return [_info(state) for state in _all_states(request.app)]
 
 
 @router.get("/runs/{run_id}", response_model=RunDetail, responses={404: {"description": "Unknown run"}})
 def get_run(run_id: str, request: Request) -> RunDetail:
-    """Return summary() and by_category() for a run."""
-    state = _require_state(request.app, run_id)
-    frame = _frame_or_empty(request.app, state)
+    """Return status, progress counts, summary(), and by_category()."""
+    directory = Path(request.app.state.runs_directory)
+    stored = _stored_or_http(run_id, directory)
+    progress = run_progress(run_id, directory=directory)
+    frame = _frame_for(request.app, run_id, progress.grades_done)
+    status = _status_name(stored.status)
     return RunDetail(
-        run_id=state.run_id,
-        status=state.status,
-        provider=state.provider,
-        error=state.error,
+        run_id=run_id,
+        status=status,
+        provider=stored.provider or stored.model,
+        error=stored.error,
+        answers_done=progress.answers_done,
+        answers_expected=progress.answers_expected,
+        grades_done=progress.grades_done,
+        grades_expected=progress.grades_expected,
         summary=_summary_models(frame),
         by_category=_category_payload(frame),
     )
@@ -276,8 +360,10 @@ def get_run(run_id: str, request: Request) -> RunDetail:
 )
 def get_failures(run_id: str, request: Request) -> list[FailureOut]:
     """Return failures() for a run."""
-    state = _require_state(request.app, run_id)
-    frame = _frame_or_empty(request.app, state)
+    directory = Path(request.app.state.runs_directory)
+    _stored_or_http(run_id, directory)
+    progress = run_progress(run_id, directory=directory)
+    frame = _frame_for(request.app, run_id, progress.grades_done)
     rows = failures(frame)
     return [FailureOut.model_validate(row.to_dict()) for _, row in rows.iterrows()]
 
@@ -316,26 +402,56 @@ def _execute_run(
     judge_model: str | None = None,
     attempts: int = 3,
 ) -> None:
+    directory = Path(app.state.runs_directory)
     try:
         provider = create_provider(provider_name, model=model, temperature=temperature)
-        judge = None
-        if judge_provider:
-            judge = create_judge_provider(judge_provider, model=judge_model)
         catalog = _rubric_catalog_from_app(app)
-        results = run_eval(
+        answer_run(
             dataset,
             provider,
             run_id,
+            attempts=attempts,
             workers=workers,
-            judge=judge,
+            directory=directory,
             rubrics=catalog,
-            repeats=attempts,
+            temperature=temperature,
+            provider_name=provider_name,
         )
-        save_results(run_id, results, directory=app.state.runs_directory, attempts=attempts)
+        judge = None
+        if judge_provider:
+            judge = create_judge_provider(judge_provider, model=judge_model)
+        grade_run(
+            run_id,
+            judge=judge,
+            judge_model=judge_model,
+            directory=directory,
+            rubrics=catalog,
+        )
     except Exception as exc:  # noqa: BLE001 - record the failure instead of dropping the run
+        _mark_failed(directory, run_id, str(exc))
         _update_state(app, run_id, status="failed", error=str(exc))
-        return
-    _update_state(app, run_id, status="completed")
+
+
+def _execute_grade(
+    app: FastAPI,
+    run_id: str,
+    judge_provider: str | None,
+    judge_model: str | None,
+) -> None:
+    directory = Path(app.state.runs_directory)
+    try:
+        judge = None
+        if judge_provider:
+            judge = create_judge_provider(judge_provider, model=judge_model)
+        grade_run(
+            run_id,
+            judge=judge,
+            judge_model=judge_model,
+            directory=directory,
+            rubrics=_rubric_catalog_from_app(app),
+        )
+    except Exception as exc:  # noqa: BLE001 - record the failure instead of dropping the run
+        _mark_failed(directory, run_id, str(exc))
 
 
 def _rubric_catalog(request: Request) -> dict[str, Rubric]:
@@ -375,59 +491,66 @@ def _update_state(
 
 
 def _all_states(app: FastAPI) -> list[_RunState]:
+    directory = Path(app.state.runs_directory)
     with app.state.lock:
         known = {state.run_id: state for state in app.state.runs.values()}
-    for run_id in list_run_ids(directory=Path(app.state.runs_directory)):
-        if run_id not in known:
-            known[run_id] = _state_from_disk(app, run_id)
+    for run_id in list_run_ids(directory=directory):
+        known[run_id] = _state_from_disk(app, run_id)
     return [known[run_id] for run_id in sorted(known)]
 
 
-def _require_state(app: FastAPI, run_id: str) -> _RunState:
-    if not run_id or run_id in {".", ".."} or any(sep in run_id for sep in ("/", "\\", "\0")):
-        raise HTTPException(status_code=400, detail=f"invalid run id: {run_id}")
-    with app.state.lock:
-        state = app.state.runs.get(run_id)
-    if state is not None:
-        return state
-    if run_id in list_run_ids(directory=Path(app.state.runs_directory)):
-        return _state_from_disk(app, run_id)
-    raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
-
-
 def _state_from_disk(app: FastAPI, run_id: str) -> _RunState:
-    try:
-        results = load_results(run_id, directory=app.state.runs_directory)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-    provider = results[0].model if results else None
+    stored = _stored_or_http(run_id, Path(app.state.runs_directory))
     return _RunState(
         run_id=run_id,
-        status="completed",
-        provider=provider or "",
-        dataset="",
+        status=_status_name(stored.status),
+        provider=stored.provider or stored.model or "",
+        dataset=stored.dataset or "",
+        error=stored.error,
     )
 
 
-def _frame_or_empty(app: FastAPI, state: _RunState) -> pd.DataFrame:
-    if state.status != "completed":
+def _stored_or_http(run_id: str, directory: Path) -> StoredRun:
+    try:
+        stored = load_run(run_id, directory=directory)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
+    return stored
+
+
+def _status_name(status: str | None) -> RunStatusName:
+    if status in {"answering", "answered", "grading", "graded", "interrupted", "failed"}:
+        return status
+    return "failed"
+
+
+def _frame_for(app: FastAPI, run_id: str, grades_done: int) -> pd.DataFrame:
+    if grades_done == 0:
         return load_runs([], directory=app.state.runs_directory)
-    return _completed_frame(app, state.run_id)
-
-
-def _completed_frame(app: FastAPI, run_id: str) -> pd.DataFrame:
-    state = _require_state(app, run_id)
-    if state.status == "running":
-        raise HTTPException(status_code=409, detail=f"run {run_id} is still running")
-    if state.status == "failed":
-        detail = state.error or f"run {run_id} failed"
-        raise HTTPException(status_code=409, detail=detail)
     try:
         return load_runs(run_id, directory=app.state.runs_directory)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"unknown run: {run_id}") from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+def _completed_frame(app: FastAPI, run_id: str) -> pd.DataFrame:
+    stored = _stored_or_http(run_id, Path(app.state.runs_directory))
+    if stored.status == "failed":
+        detail = stored.error or f"run {run_id} failed"
+        raise HTTPException(status_code=409, detail=detail)
+    if stored.status != "graded":
+        raise HTTPException(status_code=409, detail=f"run {run_id} is still {stored.status}")
+    return _frame_for(app, run_id, 1)
+
+
+def _mark_failed(directory: Path, run_id: str, error: str) -> None:
+    if load_run(run_id, directory=directory) is None:
+        return
+    upsert_run(run_id, directory=directory, status="failed", error=error)
 
 
 def _summary_models(frame: pd.DataFrame) -> list[ModelSummary]:

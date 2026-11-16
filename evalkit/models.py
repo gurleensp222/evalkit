@@ -32,12 +32,22 @@ class Task(BaseModel):
         return self
 
 
+class CriterionMark(BaseModel):
+    """Whether one rubric criterion was met."""
+
+    criterion_id: str
+    met: bool
+    reason: str
+
+
 class ScoreResult(BaseModel):
     """Score for a single model output."""
 
     score: float = Field(ge=0, le=1)
     passed: bool
     reason: str
+    forced_failure: str | None = None
+    criteria: list[CriterionMark] = Field(default_factory=list)
 
 
 class TaskResult(BaseModel):
@@ -59,3 +69,4 @@ class TaskResult(BaseModel):
     rubric_id: str | None = None
     rubric_version: int | None = None
     rubric_hash: str | None = None
+    judge: str | None = None

@@ -97,3 +97,13 @@ class TaskResult(BaseModel):
     rubric_version: int | None = None
     rubric_hash: str | None = None
     judge: str | None = None
+
+
+def _bind_extra_criteria() -> None:
+    """Resolve ``Criterion`` once both models can be imported."""
+    from evalkit.rubrics import Criterion
+
+    Task.model_rebuild(_types_namespace={"Criterion": Criterion})
+
+
+_bind_extra_criteria()

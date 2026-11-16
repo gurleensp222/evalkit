@@ -28,7 +28,7 @@ PROVIDER_OPTION = typer.Option(
 RUN_ID_OPTION = typer.Option(
     None,
     "--run-id",
-    help="Id used for runs/<run_id>.jsonl.",
+    help="Id used for this run in runs/evalkit.db.",
 )
 
 
@@ -84,9 +84,11 @@ def _print_summary(run_id: str, results: list[TaskResult]) -> None:
     )
     for result in results:
         label = "pass" if result.passed else "fail"
+        flags = "  unstable" if result.unstable else ""
+        kind = f"  {result.failure_type}" if result.failure_type else ""
         typer.echo(
-            f"{result.task_id}  {label}  {result.score:.2f}  "
-            f"{result.latency_ms:.0f}ms  {_short(result.reason)}"
+            f"{result.task_id}  attempt {result.attempt}  {label}  {result.score:.2f}  "
+            f"{result.latency_ms:.0f}ms{flags}{kind}  {_short(result.reason)}"
         )
 
 

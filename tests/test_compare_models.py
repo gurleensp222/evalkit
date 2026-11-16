@@ -40,8 +40,7 @@ def test_script_saves_both_runs_and_compares_them(tmp_path: Path, monkeypatch: p
         ["--dataset", str(dataset), "--a", "openai", "--b", "anthropic", "--runs-dir", str(tmp_path / "runs")]
     )
     assert code == 0
-    saved = list((tmp_path / "runs").glob("*.jsonl"))
-    assert len(saved) == 2
+    assert (tmp_path / "runs" / "evalkit.db").is_file()
     output = capsys.readouterr().out
     assert "openai pass_rate 1.00" in output
     assert "anthropic pass_rate 0.00" in output

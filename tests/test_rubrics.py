@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from evalkit.cli import app
 from evalkit.models import Task
 from evalkit.providers import MockProvider, create_judge_provider
-from evalkit.rubrics import Rubric, load_prompts, load_rubrics
+from evalkit.rubrics import Rubric, lint_rubrics, load_prompts, load_rubrics
 from evalkit.runner import run_eval
 from evalkit.storage import load_results, save_results
 
@@ -23,6 +23,36 @@ def _write(directory: Path, name: str, payload: dict[str, object]) -> None:
     (directory / name).write_text(yaml.safe_dump(payload), encoding="utf-8")
 
 
+def _criterion(
+    criterion_id: str,
+    weight: float,
+    description: str,
+    **overrides: object,
+) -> dict[str, object]:
+    criterion: dict[str, object] = {
+        "id": criterion_id,
+        "weight": weight,
+        "description": description,
+        "necessity": "explicit",
+        "kind": "objective",
+        "answer_key": "A stated fact.",
+    }
+    criterion.update(overrides)
+    return criterion
+
+
+def _implicit(weight: float = 0.5) -> dict[str, object]:
+    return _criterion(
+        "goes-further",
+        weight,
+        "The reply adds a useful detail.",
+        necessity="implicit",
+        kind="subjective",
+        example="A reply that adds one concrete next step.",
+        answer_key=None,
+    )
+
+
 def _rubric(rubric_id: str = "demo") -> dict[str, object]:
     return {
         "id": rubric_id,
@@ -30,22 +60,31 @@ def _rubric(rubric_id: str = "demo") -> dict[str, object]:
         "description": "Demo rubric.",
         "pass_threshold": 0.5,
         "criteria": [
-            {"id": "one", "weight": 0.5, "description": "First part."},
-            {"id": "two", "weight": 0.5, "description": "Second part."},
+            _criterion("one", 0.5, "First part."),
+            _implicit(),
         ],
     }
+
+
+def _lint(criteria: list[dict[str, object]], rubric_id: str = "demo") -> list[str]:
+    payload = _rubric(rubric_id)
+    payload["criteria"] = criteria
+    rubric = Rubric.model_validate(payload)
+    return lint_rubrics({rubric.id: rubric})
 
 
 def test_shipped_rubrics_and_prompts_load() -> None:
     rubrics = load_rubrics(RUBRICS)
     assert set(rubrics) == {"helpful_answer_v1", "code_explanation_v1"}
     helpful = rubrics["helpful_answer_v1"]
+    assert helpful.version == 2
     assert helpful.pass_threshold == 0.7
     assert [item.id for item in helpful.criteria] == [
-        "accuracy",
-        "instruction_following",
-        "tone",
-        "safety",
+        "answers_question",
+        "no_invented_policy",
+        "actionable_next_step",
+        "plain_language",
+        "no_sensitive_data_request",
     ]
     prompts = load_prompts(PROMPTS, rubrics)
     assert len(prompts) == 10
@@ -53,8 +92,24 @@ def test_shipped_rubrics_and_prompts_load() -> None:
         "helpful_answer_v1",
         "code_explanation_v1",
     }
-    assert "accuracy" in helpful.render()
-    assert "weight 0.40" in helpful.render()
+    answers = helpful.criteria[0]
+    assert answers.necessity == "explicit"
+    assert answers.kind == "subjective"
+    assert answers.example
+    assert answers.critical is False
+    invented = next(item for item in helpful.criteria if item.id == "no_invented_policy")
+    assert invented.necessity == "implicit"
+    assert invented.answer_key
+    sensitive = next(item for item in helpful.criteria if item.id == "no_sensitive_data_request")
+    assert sensitive.kind == "objective"
+    assert sensitive.critical is True
+    code = rubrics["code_explanation_v1"]
+    assert code.criteria[0].kind == "objective"
+    assert code.criteria[0].answer_key
+    assert any(item.necessity == "implicit" for item in code.criteria)
+    assert "answers_question" in helpful.render()
+    assert "weight 0.30" in helpful.render()
+    assert "answer key:" in helpful.render()
 
 
 def test_content_hash_changes_when_the_rubric_changes() -> None:
@@ -68,8 +123,8 @@ def test_content_hash_changes_when_the_rubric_changes() -> None:
 def test_bad_rubrics_are_rejected(tmp_path: Path) -> None:
     weights = _rubric()
     weights["criteria"] = [
-        {"id": "one", "weight": 0.5, "description": "First."},
-        {"id": "two", "weight": 0.6, "description": "Second."},
+        _criterion("one", 0.5, "First."),
+        _criterion("two", 0.6, "Second."),
     ]
     _write(tmp_path, "demo.yaml", weights)
     with pytest.raises(ValueError, match="sum to 1.0"):
@@ -77,8 +132,8 @@ def test_bad_rubrics_are_rejected(tmp_path: Path) -> None:
 
     duplicate = _rubric()
     duplicate["criteria"] = [
-        {"id": "accuracy", "weight": 0.5, "description": "First."},
-        {"id": "accuracy", "weight": 0.5, "description": "Again."},
+        _criterion("accuracy", 0.5, "First."),
+        _criterion("accuracy", 0.5, "Again."),
     ]
     _write(tmp_path, "demo.yaml", duplicate)
     with pytest.raises(ValueError, match="duplicate criterion ids"):
@@ -145,7 +200,7 @@ def test_rubric_task_is_scored_by_a_mock_judge_and_saved(tmp_path: Path) -> None
             timeout: float | None = None,
         ) -> str:
             del task_id, timeout
-            assert "accuracy" in prompt
+            assert "answers_question" in prompt
             assert "30 days" in prompt
             return '{"score": 5, "reason": "meets the rubric"}'
 
@@ -171,7 +226,7 @@ def test_rubric_task_is_scored_by_a_mock_judge_and_saved(tmp_path: Path) -> None
     row = sqlite3.connect(database).execute(
         "SELECT rubric_id, rubric_version, rubric_hash FROM runs WHERE run_id = 'rubric-run'"
     ).fetchone()
-    assert row == ("helpful_answer_v1", 1, rubric.content_hash)
+    assert row == ("helpful_answer_v1", rubric.version, rubric.content_hash)
 
 
 def test_rubric_pass_threshold_overrides_the_judge_default() -> None:
@@ -274,3 +329,201 @@ def test_rubric_model_rejects_a_direct_bad_level_key() -> None:
     payload["criteria"][0]["levels"] = {"0": "too low", "5": "high"}
     with pytest.raises(ValidationError, match="1 to 5"):
         Rubric.model_validate(payload)
+
+
+def test_objective_criteria_require_an_answer_key() -> None:
+    missing = _criterion("one", 1.0, "The reply states 4.", answer_key=None)
+    with pytest.raises(ValidationError, match="answer_key"):
+        Rubric.model_validate({**_rubric(), "criteria": [missing]})
+    blank = _criterion("one", 1.0, "The reply states 4.", answer_key="  ")
+    with pytest.raises(ValidationError, match="answer_key"):
+        Rubric.model_validate({**_rubric(), "criteria": [blank]})
+    kept = Rubric.model_validate(
+        {**_rubric(), "criteria": [_criterion("one", 1.0, "The reply states 4.")]}
+    )
+    assert kept.criteria[0].answer_key == "A stated fact."
+    assert kept.criteria[0].critical is False
+
+
+def test_subjective_criteria_require_an_example() -> None:
+    missing = _criterion(
+        "one",
+        1.0,
+        "The reply sounds clear.",
+        kind="subjective",
+        answer_key=None,
+    )
+    with pytest.raises(ValidationError, match="example"):
+        Rubric.model_validate({**_rubric(), "criteria": [missing]})
+    blank = _criterion(
+        "one",
+        1.0,
+        "The reply sounds clear.",
+        kind="subjective",
+        example="  ",
+        answer_key=None,
+    )
+    with pytest.raises(ValidationError, match="example"):
+        Rubric.model_validate({**_rubric(), "criteria": [blank]})
+    kept = Rubric.model_validate(
+        {
+            **_rubric(),
+            "criteria": [
+                _criterion(
+                    "one",
+                    1.0,
+                    "The reply sounds clear.",
+                    kind="subjective",
+                    example="A plain reply.",
+                    answer_key=None,
+                )
+            ],
+        }
+    )
+    assert kept.criteria[0].example == "A plain reply."
+    assert kept.criteria[0].necessity == "explicit"
+
+
+def test_necessity_and_kind_are_closed_sets() -> None:
+    bad_necessity = _criterion("one", 1.0, "The reply states 4.", necessity="optional")
+    with pytest.raises(ValidationError):
+        Rubric.model_validate({**_rubric(), "criteria": [bad_necessity]})
+    bad_kind = _criterion("one", 1.0, "The reply states 4.", kind="mixed")
+    with pytest.raises(ValidationError):
+        Rubric.model_validate({**_rubric(), "criteria": [bad_kind]})
+
+
+def test_lint_warns_when_and_joins_two_verbs() -> None:
+    warnings = _lint(
+        [
+            _criterion("packed", 0.5, "The reply mentions bees and explains honey."),
+            _criterion(
+                "short",
+                0.5,
+                "The reply is short and clear.",
+                necessity="implicit",
+                kind="subjective",
+                example="A short reply.",
+                answer_key=None,
+            ),
+        ]
+    )
+    assert warnings == ["demo packed: description likely holds two requirements"]
+
+
+def test_lint_warns_on_a_comma_list_of_demands() -> None:
+    warnings = _lint(
+        [
+            _criterion("items", 0.5, "The reply covers price, date, and place."),
+            _criterion(
+                "aside",
+                0.5,
+                "The reply states the price, with the date in the next sentence.",
+                necessity="implicit",
+                kind="subjective",
+                example="A reply that states the price.",
+                answer_key=None,
+            ),
+        ]
+    )
+    assert warnings == ["demo items: description likely holds two requirements"]
+
+
+def test_lint_warns_when_the_grader_cannot_see_the_fact() -> None:
+    hidden = [
+        ("correct-total", "The reply states the correct total."),
+        ("quoted-figure", "The reply quotes a figure from the text."),
+        ("prompt-date", "The reply uses the date in the prompt."),
+    ]
+    criteria = [
+        _criterion(
+            criterion_id,
+            0.25,
+            description,
+            kind="subjective",
+            example="A reply that states the figure.",
+            answer_key=None,
+        )
+        for criterion_id, description in hidden
+    ]
+    criteria.append(_implicit(0.25))
+    warnings = _lint(criteria)
+    assert warnings == [
+        "demo correct-total: refers to information the grader cannot see",
+        "demo quoted-figure: refers to information the grader cannot see",
+        "demo prompt-date: refers to information the grader cannot see",
+    ]
+    grounded = _lint(
+        [
+            _criterion("correct-total", 0.5, "The reply states the correct total."),
+            _implicit(),
+        ]
+    )
+    assert grounded == []
+
+
+def test_lint_warns_on_generic_criteria() -> None:
+    generic = [
+        ("spelling", "The reply uses correct spelling."),
+        ("courtesy", "The reply shows politeness."),
+        ("obedience", "The reply follows instructions."),
+    ]
+    criteria = [_criterion(criterion_id, 0.25, description) for criterion_id, description in generic]
+    criteria.append(_implicit(0.25))
+    warnings = _lint(criteria)
+    assert warnings == [
+        "demo spelling: criterion is generic",
+        "demo courtesy: criterion is generic",
+        "demo obedience: criterion is generic",
+    ]
+
+
+def test_lint_warns_when_a_rubric_has_no_implicit_criteria() -> None:
+    warnings = _lint(
+        [
+            _criterion("one", 0.5, "The reply states 4."),
+            _criterion(
+                "two",
+                0.5,
+                "The reply sounds clear.",
+                kind="subjective",
+                example="A plain reply.",
+                answer_key=None,
+            ),
+        ]
+    )
+    assert warnings == ["demo: rubric has no implicit criteria"]
+
+
+def test_cli_lint_prints_ids_and_does_not_fail(tmp_path: Path) -> None:
+    runner = CliRunner()
+    clean = tmp_path / "clean"
+    _write(clean, "demo.yaml", _rubric("demo"))
+    quiet = runner.invoke(app, ["rubrics", "lint", "--directory", str(clean)])
+    assert quiet.exit_code == 0
+    assert quiet.stdout.strip() == "1 rubrics ok"
+
+    noisy = tmp_path / "noisy"
+    payload = _rubric("demo")
+    payload["criteria"] = [_criterion("spelling", 1.0, "The reply uses correct spelling.")]
+    _write(noisy, "demo.yaml", payload)
+    warned = runner.invoke(app, ["rubrics", "lint", "--directory", str(noisy)])
+    assert warned.exit_code == 0
+    assert "demo spelling: criterion is generic" in warned.stdout
+    assert "demo: rubric has no implicit criteria" in warned.stdout
+
+    strict = runner.invoke(app, ["rubrics", "lint", "--strict", "--directory", str(noisy)])
+    assert strict.exit_code == 1
+    assert "demo spelling: criterion is generic" in strict.stdout
+
+    strict_clean = runner.invoke(app, ["rubrics", "lint", "--strict", "--directory", str(clean)])
+    assert strict_clean.exit_code == 0
+    assert strict_clean.stdout.strip() == "1 rubrics ok"
+
+    shipped = runner.invoke(app, ["rubrics", "lint", "--strict", "--directory", str(RUBRICS)])
+    assert shipped.exit_code == 0
+    assert shipped.stdout.strip() == "2 rubrics ok"
+
+    missing = runner.invoke(app, ["rubrics", "lint", "--directory", str(tmp_path / "absent")])
+    assert missing.exit_code == 1
+    assert "rubric directory not found" in missing.stdout + (missing.stderr or "")

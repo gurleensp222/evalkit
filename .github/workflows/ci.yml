@@ -27,6 +27,9 @@ jobs:
       - name: Pytest
         run: pytest -m "not ollama" --cov=evalkit --cov-report=term-missing --cov-fail-under=80
 
+      - name: Rubric lint
+        run: evalkit rubrics lint --strict
+
       # The mock sample set passes 4 of 8 tasks. Fail if that rate drops.
       - name: Smoke eval
         env:

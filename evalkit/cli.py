@@ -11,7 +11,7 @@ import typer
 
 from evalkit.models import TaskResult
 from evalkit.providers import ProviderError, create_judge_provider, create_provider
-from evalkit.rubrics import Rubric, load_prompts, load_rubrics
+from evalkit.rubrics import Rubric, lint_rubrics, load_prompts, load_rubrics
 from evalkit.runner import run_eval
 from evalkit.storage import load_results, save_results
 
@@ -69,9 +69,14 @@ RUBRICS_OPTION = typer.Option(
     "--directory",
     help="Folder of YAML rubrics.",
 )
+STRICT_OPTION = typer.Option(
+    False,
+    "--strict",
+    help="Exit with code 1 when lint finds a warning.",
+)
 DEFAULT_RUBRICS = Path("datasets/rubrics")
 
-rubrics_app = typer.Typer(help="List and validate rubric files.", no_args_is_help=True)
+rubrics_app = typer.Typer(help="List, validate, and lint rubric files.", no_args_is_help=True)
 app.add_typer(rubrics_app, name="rubrics")
 
 
@@ -170,6 +175,20 @@ def list_rubrics(directory: Path = RUBRICS_OPTION) -> None:
 def validate_rubrics(directory: Path = RUBRICS_OPTION) -> None:
     """Check every rubric file and print how many loaded."""
     catalog = _require_rubrics(directory)
+    typer.echo(f"{len(catalog)} rubrics ok")
+
+
+@rubrics_app.command("lint")
+def lint(directory: Path = RUBRICS_OPTION, strict: bool = STRICT_OPTION) -> None:
+    """Warn about criteria that are hard for a grader to apply."""
+    catalog = _require_rubrics(directory)
+    warnings = lint_rubrics(catalog)
+    if warnings:
+        for warning in warnings:
+            typer.echo(warning)
+        if strict:
+            raise typer.Exit(1)
+        return
     typer.echo(f"{len(catalog)} rubrics ok")
 
 

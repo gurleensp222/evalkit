@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -14,6 +17,93 @@ from evalkit.models import Task
 
 _LEVELS = {1, 2, 3, 4, 5}
 _WEIGHT_TOLERANCE = 1e-6
+_AND = re.compile(r"\s+and\s+", re.IGNORECASE)
+_COMMA = re.compile(r",\s+")
+_LEADING_CONJUNCTION = re.compile(r"(?i)(?:and|or)\b")
+_WORD = re.compile(r"[A-Za-z']+")
+_UNSEEN = re.compile(r"\b(?:the correct|from the text|in the prompt)\b", re.IGNORECASE)
+_GENERIC = re.compile(
+    r"\b(?:spelling|politeness|follow(?:s|ing)?(?:\s+the)?\s+instructions)\b",
+    re.IGNORECASE,
+)
+_TWO_REQUIREMENTS = "description likely holds two requirements"
+_UNSEEN_FACT = "refers to information the grader cannot see"
+_GENERIC_CRITERION = "criterion is generic"
+_NO_IMPLICIT = "rubric has no implicit criteria"
+# Stems, plus auxiliaries. Surface forms such as "mentions" reduce to these.
+_VERBS = frozenset(
+    {
+        "accept",
+        "add",
+        "address",
+        "am",
+        "answer",
+        "are",
+        "ask",
+        "avoid",
+        "be",
+        "been",
+        "calculate",
+        "can",
+        "cite",
+        "claim",
+        "compare",
+        "contain",
+        "could",
+        "cover",
+        "define",
+        "describe",
+        "did",
+        "do",
+        "does",
+        "explain",
+        "follow",
+        "format",
+        "give",
+        "had",
+        "handle",
+        "has",
+        "have",
+        "identify",
+        "include",
+        "invent",
+        "is",
+        "keep",
+        "leak",
+        "list",
+        "match",
+        "may",
+        "mention",
+        "might",
+        "must",
+        "name",
+        "omit",
+        "provide",
+        "quote",
+        "raise",
+        "recommend",
+        "refuse",
+        "remain",
+        "return",
+        "shall",
+        "should",
+        "show",
+        "skip",
+        "sound",
+        "state",
+        "stay",
+        "suggest",
+        "summarize",
+        "tell",
+        "use",
+        "warn",
+        "was",
+        "were",
+        "will",
+        "would",
+        "write",
+    }
+)
 
 
 class Criterion(BaseModel):
@@ -22,6 +112,11 @@ class Criterion(BaseModel):
     id: str
     weight: float = Field(gt=0)
     description: str
+    necessity: Literal["explicit", "implicit"]
+    kind: Literal["objective", "subjective"]
+    critical: bool = False
+    answer_key: str | None = None
+    example: str | None = None
     levels: dict[int, str] | None = None
 
     @field_validator("levels", mode="before")
@@ -46,6 +141,14 @@ class Criterion(BaseModel):
         if bad:
             raise ValueError(f"level keys must be integers from 1 to 5, got {bad}")
         return levels
+
+    @model_validator(mode="after")
+    def grounding_matches_kind(self) -> Criterion:
+        if self.kind == "objective" and not _present(self.answer_key):
+            raise ValueError("objective criteria require answer_key")
+        if self.kind == "subjective" and not _present(self.example):
+            raise ValueError("subjective criteria require example")
+        return self
 
 
 class Rubric(BaseModel):
@@ -89,13 +192,40 @@ class Rubric(BaseModel):
             "Criteria:",
         ]
         for criterion in self.criteria:
-            lines.append(
-                f"- {criterion.id} (weight {criterion.weight:.2f}): {criterion.description.strip()}"
-            )
+            details = f"weight {criterion.weight:.2f}, {criterion.necessity}, {criterion.kind}"
+            if criterion.critical:
+                details += ", critical"
+            lines.append(f"- {criterion.id} ({details}): {criterion.description.strip()}")
+            answer_key = criterion.answer_key
+            if answer_key and answer_key.strip():
+                lines.append(f"  answer key: {answer_key.strip()}")
+            example = criterion.example
+            if example and example.strip():
+                lines.append(f"  example: {example.strip()}")
             if criterion.levels:
                 for score in sorted(criterion.levels):
                     lines.append(f"  {score}: {criterion.levels[score].strip()}")
         return "\n".join(lines)
+
+
+def lint_rubrics(rubrics: Mapping[str, Rubric]) -> list[str]:
+    """Return warnings for criteria that are hard for a grader to apply.
+
+    Warnings name the rubric id and, when the problem is one criterion, that
+    criterion's id. A rubric that fails to load is not a warning.
+    """
+    warnings: list[str] = []
+    for rubric in rubrics.values():
+        for criterion in rubric.criteria:
+            if _holds_two_requirements(criterion.description):
+                warnings.append(_warning(rubric.id, criterion.id, _TWO_REQUIREMENTS))
+            if _grader_cannot_see(criterion):
+                warnings.append(_warning(rubric.id, criterion.id, _UNSEEN_FACT))
+            if _is_generic(criterion):
+                warnings.append(_warning(rubric.id, criterion.id, _GENERIC_CRITERION))
+        if not any(criterion.necessity == "implicit" for criterion in rubric.criteria):
+            warnings.append(_warning(rubric.id, None, _NO_IMPLICIT))
+    return warnings
 
 
 def load_rubrics(directory: str | Path) -> dict[str, Rubric]:
@@ -151,6 +281,69 @@ def load_prompts(path: str | Path, rubrics: Mapping[str, Rubric]) -> list[Task]:
     if problems:
         raise ValueError("\n".join(problems))
     return tasks
+
+
+def _present(value: str | None) -> bool:
+    return value is not None and bool(value.strip())
+
+
+def _warning(rubric_id: str, criterion_id: str | None, message: str) -> str:
+    if criterion_id is None:
+        return f"{rubric_id}: {message}"
+    return f"{rubric_id} {criterion_id}: {message}"
+
+
+def _holds_two_requirements(description: str) -> bool:
+    return _and_joins_two_verbs(description) or _comma_list_of_demands(description)
+
+
+def _and_joins_two_verbs(description: str) -> bool:
+    parts = _AND.split(description)
+    pairs = itertools.pairwise(parts)
+    return any(_contains_verb(left) and _contains_verb(right) for left, right in pairs)
+
+
+def _contains_verb(text: str) -> bool:
+    return any(_is_verb(word) for word in _WORD.findall(text))
+
+
+def _is_verb(word: str) -> bool:
+    token = word.lower().strip("'")
+    stems = {token}
+    if len(token) > 4 and token.endswith("ies"):
+        stems.add(token[:-3] + "y")
+    if len(token) > 3 and token.endswith("s"):
+        stems.add(token[:-1])
+    if len(token) > 4 and token.endswith("es"):
+        stems.add(token[:-2])
+    if len(token) > 4 and token.endswith("ed"):
+        stems.add(token[:-2])
+        stems.add(token[:-1])
+    if len(token) > 5 and token.endswith("ing"):
+        stems.add(token[:-3])
+        stems.add(f"{token[:-3]}e")
+    return bool(stems & _VERBS)
+
+
+def _comma_list_of_demands(description: str) -> bool:
+    """True when commas separate a list of demands, not a single aside."""
+    chunks = [chunk.strip() for chunk in _COMMA.split(description) if chunk.strip()]
+    if len(chunks) >= 3:
+        return True
+    return len(chunks) == 2 and _LEADING_CONJUNCTION.match(chunks[1]) is not None
+
+
+def _grader_cannot_see(criterion: Criterion) -> bool:
+    if _present(criterion.answer_key):
+        return False
+    return _UNSEEN.search(criterion.description) is not None
+
+
+def _is_generic(criterion: Criterion) -> bool:
+    criterion_id = criterion.id.replace("_", " ")
+    described = _GENERIC.search(criterion.description) is not None
+    named = _GENERIC.search(criterion_id) is not None
+    return described or named
 
 
 def _read_rubric(path: Path) -> Rubric:

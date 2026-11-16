@@ -5,6 +5,10 @@ pass_threshold: 0.6
 criteria:
   - id: correctness
     weight: 0.5
+    necessity: explicit
+    kind: objective
+    critical: true
+    answer_key: The explanation matches the real behavior of the language or tool.
     description: The explanation matches how the language or tool actually behaves.
     levels:
       1: The explanation is wrong.
@@ -14,7 +18,13 @@ criteria:
       5: Correct and precise.
   - id: clarity
     weight: 0.3
+    necessity: implicit
+    kind: subjective
+    example: A reader new to the topic can restate the idea after one reading.
     description: A reader can follow the explanation without already knowing the answer.
   - id: completeness
     weight: 0.2
+    necessity: explicit
+    kind: subjective
+    example: The explanation answers the question and adds a short example when one is needed.
     description: The explanation covers the question that was asked, including an example when one is needed.

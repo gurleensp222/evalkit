@@ -61,7 +61,10 @@ An Ollama run records the model id, not the word `ollama`:
 
 ```bash
 evalkit run --provider ollama --model llama3.2 --temperature 0.2
+evalkit run --config agents.example.yaml
 ```
+
+`agents.example.yaml` sets the answer model to Ollama `llama3.2` at temperature 0.7 and the grader to `qwen2.5:3b` at temperature 0. A flag on the command replaces the matching value in the file.
 
 `evalkit run` prints a run id, a pass count, and one line per task. CI runs this same command and fails if the sample pass rate drops below 0.50.
 
@@ -127,6 +130,10 @@ criteria:
 {"id": "refund-window", "category": "support", "prompt": "A customer asks how long they have to request a refund. The policy is 30 days from delivery. Reply in two sentences.", "rubric_id": "helpful_answer_v1"}
 ```
 
+A prompt can add `extra_criteria` using the same criterion fields. The rubric criteria keep their relative weights, the extra criteria use the weights written on the prompt, and then every weight is scaled so the set sums to 1. A criterion id that already appears on the rubric is rejected. The grade stores a hash of that merged rubric. `evalkit rubrics lint` also warns on `extra_criteria` in `datasets/prompts`.
+
+`no_fabricated_links` fails when the answer contains an `http` or `https` URL that is not in the task's `allowed_urls` list. An empty list allows no links. A rubric task can set `deterministic_checks` to `["no_fabricated_links"]`. A failed check is stored as `critical:no_fabricated_links` and the judge is not called for that attempt.
+
 ```bash
 evalkit rubrics list
 evalkit rubrics lint --strict
@@ -139,7 +146,7 @@ The judge runs at temperature 0 and is asked for JSON. Each saved row stores the
 
 Each line of a dataset is a task: an id, a category, a prompt, a scorer name, and the `expected` value that scorer checks. A provider turns the prompt into text. Built-in providers are `mock`, `ollama`, `openai`, and `anthropic`.
 
-The runner loads the file, calls the provider from a pool of four workers, retries a failed call, and applies a timeout to each attempt. One failed task is stored with score 0 and the run continues. The named scorer maps the output to a score from 0 to 1. Scorers are `exact_match`, `contains_all`, `json_valid`, `python_unit_tests`, and `llm_judge`.
+The runner loads the file, calls the provider from a pool of four workers, retries a failed call, and applies a timeout to each attempt. One failed task is stored with score 0 and the run continues. The named scorer maps the output to a score from 0 to 1. Scorers are `exact_match`, `contains_all`, `json_valid`, `python_unit_tests`, `llm_judge`, and `no_fabricated_links`.
 
 Storage writes one JSON object per line to `runs/<run_id>.jsonl`. Analysis loads those files and reports pass rate, mean score, latency, a category-by-model table, the failures, and a paired comparison of two models.
 
@@ -155,7 +162,7 @@ Storage writes one JSON object per line to `runs/<run_id>.jsonl`. Analysis loads
 
 The code scorer is a separate process with a timeout. It still runs as the same user, with a normal Python install, so it is the wrong place to run untrusted model output that should be denied network or filesystem access. A container with those limits removed would be the next boundary.
 
-`llm_judge` sends the prompt, the answer, and a rubric to a judge model and tells it not to reward length. The judge can still prefer a familiar style. A raw score of 3, 4, or 5 passes. `evalkit run` does not take a judge; use `scripts/compare_models.py --judge` for a dataset that uses that scorer.
+`llm_judge` sends the prompt, the answer, and a rubric to a judge model and tells it not to reward length. The judge can still prefer a familiar style. A raw score of 3, 4, or 5 passes. Pass `--judge-provider`, or use `evalkit run --config agents.example.yaml`, when a task needs a judge.
 
 The table above is the mock provider, not two live models. With API keys set:
 

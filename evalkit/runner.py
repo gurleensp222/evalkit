@@ -12,8 +12,8 @@ from typing import Any
 from evalkit.grading import GRADER_CONTEXTS, grade_response
 from evalkit.models import ScoreResult, Task, TaskResult
 from evalkit.providers import Provider
-from evalkit.rubrics import Rubric, load_prompts
-from evalkit.scorers import SCORERS, llm_judge
+from evalkit.rubrics import Rubric, applied_rubric, load_prompts
+from evalkit.scorers import SCORERS, llm_judge, no_fabricated_links
 
 MAX_WORKERS = 4
 DEFAULT_RETRIES = 3
@@ -186,7 +186,7 @@ def _evaluate_task(
         output = ""
         scored = ScoreResult(score=0.0, passed=False, reason=f"provider failed: {exc}")
     elapsed_ms = (time.perf_counter() - started) * 1000
-    rubric = rubrics.get(task.rubric_id) if task.rubric_id else None
+    rubric = _applied(task, rubrics)
     return TaskResult(
         run_id=run_id,
         task_id=task.id,
@@ -315,6 +315,8 @@ def _score_output(
                     reason="llm_judge requires a judge provider",
                 )
             return llm_judge(output, task.expected, prompt=task.prompt, judge=judge)
+        if scorer is no_fabricated_links:
+            return no_fabricated_links(output, task.allowed_urls)
         return scorer(output, task.expected)
     except Exception as exc:  # noqa: BLE001 - a scorer bug should be a failed score
         return ScoreResult(score=0.0, passed=False, reason=f"scorer failed: {exc}")
@@ -328,9 +330,15 @@ def _score_with_rubric(
     *,
     grader_context: str = "with_prompt",
 ) -> ScoreResult:
-    rubric = rubrics.get(task.rubric_id or "")
+    try:
+        rubric = applied_rubric(task, rubrics)
+    except ValueError as exc:
+        return ScoreResult(score=0.0, passed=False, reason=str(exc))
     if rubric is None:
         return ScoreResult(score=0.0, passed=False, reason=f"unknown rubric: {task.rubric_id}")
+    blocked = _failed_deterministic_check(task, output)
+    if blocked is not None:
+        return blocked
     if judge is None:
         return ScoreResult(score=0.0, passed=False, reason="llm_judge requires a judge provider")
     return grade_response(
@@ -340,3 +348,31 @@ def _score_with_rubric(
         judge,
         context=grader_context,
     )
+
+
+def _applied(task: Task, rubrics: Mapping[str, Rubric]) -> Rubric | None:
+    try:
+        return applied_rubric(task, rubrics)
+    except ValueError:
+        rubric = rubrics.get(task.rubric_id) if task.rubric_id else None
+        return rubric
+
+
+def _failed_deterministic_check(task: Task, output: str) -> ScoreResult | None:
+    """Return a critical failure when a check listed on the task does not pass."""
+    for name in task.deterministic_checks:
+        if name != "no_fabricated_links":
+            return ScoreResult(
+                score=0.0,
+                passed=False,
+                reason=f"unknown deterministic check: {name}",
+            )
+        checked = no_fabricated_links(output, task.allowed_urls)
+        if not checked.passed:
+            return ScoreResult(
+                score=0.0,
+                passed=False,
+                reason=checked.reason,
+                forced_failure=f"critical:{name}",
+            )
+    return None

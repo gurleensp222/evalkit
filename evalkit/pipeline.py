@@ -11,7 +11,7 @@ from threading import Lock
 from evalkit.grading import GRADER_CONTEXTS
 from evalkit.models import CriterionMark, ScoreResult, Task, TaskResult
 from evalkit.providers import Provider
-from evalkit.rubrics import Rubric, load_prompts
+from evalkit.rubrics import Rubric, applied_rubric, load_prompts
 from evalkit.runner import (
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT_SECONDS,
@@ -24,10 +24,12 @@ from evalkit.runner import (
 )
 from evalkit.storage import (
     DEFAULT_RUNS_DIR,
+    SQLITE_DATASET,
     StoredAnswer,
     answer_keys,
     load_answers,
     load_run,
+    load_stored_prompts,
     replace_criterion_grades,
     run_progress,
     save_answer,
@@ -78,18 +80,15 @@ def answer_run(
     if resume:
         if stored is None or not stored.dataset:
             raise FileNotFoundError(run_id)
-        dataset_path = Path(stored.dataset)
+        dataset_value: str | Path = stored.dataset
         attempts = stored.attempts or attempts
     else:
         if dataset is None:
             raise ValueError("dataset is required")
         if saved:
             raise ValueError(f"run {run_id} already has answers; pass --resume")
-        dataset_path = Path(dataset)
-    if not dataset_path.exists():
-        raise ValueError(f"dataset not found: {dataset_path}")
-
-    tasks = load_prompts(dataset_path, catalog)
+        dataset_value = dataset
+    tasks, dataset_label = _tasks_from_dataset(dataset_value, catalog, directory)
     ensure_model_available(provider)
     pending = [
         (task, attempt)
@@ -105,7 +104,7 @@ def answer_run(
             status="answering",
             model=provider.name,
             provider=provider_name or (stored.provider if stored else None) or provider.name,
-            dataset=str(dataset_path.resolve()),
+            dataset=dataset_label,
             attempts=attempts,
             temperature=stored.temperature if resume and temperature is None else temperature,
             task_count=len(tasks),
@@ -159,11 +158,8 @@ def grade_run(
         raise FileNotFoundError(run_id)
     if not stored.dataset:
         raise ValueError(f"run {run_id} has no dataset")
-    dataset_path = Path(stored.dataset)
-    if not dataset_path.exists():
-        raise ValueError(f"dataset not found: {dataset_path}")
     catalog = dict(rubrics or {})
-    tasks = load_prompts(dataset_path, catalog)
+    tasks, _dataset_label = _tasks_from_dataset(stored.dataset, catalog, directory)
     answers = load_answers(run_id, directory=directory)
     if not answers:
         raise ValueError(f"run {run_id} has no answers")
@@ -219,6 +215,24 @@ def grade_run(
 
     _finish_grade(run_id, stored.model, saved, directory)
     return saved
+
+
+def _tasks_from_dataset(
+    dataset: str | Path,
+    catalog: Mapping[str, Rubric],
+    directory: Path,
+) -> tuple[list[Task], str]:
+    """Load tasks from a file or from prompts stored in SQLite.
+
+    The second value is what a run stores so a later grade can find the same
+    tasks. ``sqlite`` is kept as that word instead of a filesystem path.
+    """
+    if str(dataset) == SQLITE_DATASET:
+        return load_stored_prompts(directory, catalog), SQLITE_DATASET
+    path = Path(dataset)
+    if not path.exists():
+        raise ValueError(f"dataset not found: {path}")
+    return load_prompts(path, catalog), str(path.resolve())
 
 
 def _answer_pending(
@@ -367,7 +381,7 @@ def _grade_answer(
     else:
         output = answer.output
         scored = _score_output(task, output, judge, rubrics, grader_context=grader_context)
-    rubric = rubrics.get(task.rubric_id) if task.rubric_id else None
+    rubric = _applied_rubric(task, rubrics)
     result = TaskResult(
         run_id=run_id,
         task_id=task.id,
@@ -385,6 +399,15 @@ def _grade_answer(
         rubric_hash=None if rubric is None else rubric.content_hash,
     )
     return result, list(scored.criteria)
+
+
+def _applied_rubric(task: Task, rubrics: Mapping[str, Rubric]) -> Rubric | None:
+    try:
+        return applied_rubric(task, rubrics)
+    except ValueError:
+        if not task.rubric_id:
+            return None
+        return rubrics.get(task.rubric_id)
 
 
 def _save_marks(

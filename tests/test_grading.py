@@ -1,6 +1,7 @@
 """Per-criterion rubric grading, agent config, and the criterion report."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -10,11 +11,17 @@ from typer.testing import CliRunner
 from evalkit.agents import resolve_agents
 from evalkit.cli import app
 from evalkit.grading import grade_response
+from evalkit.models import CriterionMark, TaskResult
 from evalkit.pipeline import answer_run, grade_run
 from evalkit.providers import MockProvider
 from evalkit.rubrics import Criterion, Rubric, load_rubrics
 from evalkit.runner import failure_for
-from evalkit.storage import load_criterion_grades, load_results
+from evalkit.storage import (
+    load_criterion_grades,
+    load_results,
+    replace_criterion_grades,
+    save_results,
+)
 
 CLI = CliRunner()
 
@@ -314,6 +321,161 @@ def test_report_shows_met_rates_and_critical_failures(
     assert "critical failures" in reported.stdout
     assert "bad  attempt 1  mock  critical:safe" in reported.stdout
     assert load_results("report-run")[0].model == "mock"
+
+
+def test_show_prints_criterion_grades_for_each_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    directory = Path("runs")
+    ask = _stored_attempt("ask", 1, "WINDOW_REPLY", score=0.8, reason="first judge summary")
+    other_attempt = _stored_attempt(
+        "ask",
+        2,
+        "OTHER_REPLY",
+        score=0.8,
+        reason="first judge summary",
+    )
+    latest_ask = ask.model_copy(
+        update={"judge": "judge-b", "score": 0.4, "reason": "second judge summary"}
+    )
+    latest_other = other_attempt.model_copy(
+        update={"judge": "judge-b", "score": 0.4, "reason": "second judge summary"}
+    )
+    save_results(
+        "fake-run",
+        [ask, other_attempt, latest_ask, latest_other],
+        directory=directory,
+    )
+    _store_grades(
+        "ask",
+        1,
+        "judge-a",
+        [("clear", True, "Clear enough."), ("safe", False, "Gave a secret.")],
+        directory,
+    )
+    _store_grades(
+        "ask",
+        1,
+        "judge-b",
+        [("clear", False, "Too vague."), ("safe", True, "Kept it safe.")],
+        directory,
+    )
+    _store_grades(
+        "ask",
+        2,
+        "judge-a",
+        [("clear", True, "Second attempt is clear.")],
+        directory,
+    )
+    _store_grades(
+        "ask",
+        2,
+        "judge-b",
+        [("clear", False, "Second attempt is vague.")],
+        directory,
+    )
+    _store_grades(
+        "other-task",
+        1,
+        "judge-a",
+        [("hidden", True, "NOT_IN_SHOW")],
+        directory,
+    )
+
+    shown = CLI.invoke(app, ["show", "fake-run", "ask"])
+    assert shown.exit_code == 0, shown.output
+    assert shown.stdout.count("attempt 1\n") == 1
+    assert shown.stdout.count("attempt 2\n") == 1
+    assert "NOT_IN_SHOW" not in shown.stdout
+    assert "first judge summary" not in shown.stdout
+
+    blocks = _attempt_blocks(shown.stdout)
+    assert "score: 0.40" in blocks[1]
+    assert "second judge summary" in blocks[1]
+    assert blocks[1].index("WINDOW_REPLY") < blocks[1].index("judge: judge-a")
+    assert blocks[1].index("judge: judge-a") < blocks[1].index("judge: judge-b")
+    assert _grade_rows(blocks[1], "judge-a") == [
+        ("clear", "yes", "Clear enough."),
+        ("safe", "no", "Gave a secret."),
+    ]
+    assert _grade_rows(blocks[1], "judge-b") == [
+        ("clear", "no", "Too vague."),
+        ("safe", "yes", "Kept it safe."),
+    ]
+    assert blocks[2].index("OTHER_REPLY") < blocks[2].index("judge: judge-a")
+    assert _grade_rows(blocks[2], "judge-a") == [("clear", "yes", "Second attempt is clear.")]
+    assert _grade_rows(blocks[2], "judge-b") == [("clear", "no", "Second attempt is vague.")]
+
+
+def _stored_attempt(
+    task_id: str,
+    attempt: int,
+    output: str,
+    *,
+    score: float,
+    reason: str,
+) -> TaskResult:
+    return TaskResult(
+        run_id="fake-run",
+        task_id=task_id,
+        attempt=attempt,
+        category="support",
+        model="mock",
+        output=output,
+        score=score,
+        passed=score >= 0.6,
+        reason=reason,
+        latency_ms=12,
+        judge="judge-a",
+        rubric_id="demo",
+        rubric_version=1,
+        rubric_hash="hash",
+    )
+
+
+def _store_grades(
+    task_id: str,
+    attempt: int,
+    judge: str,
+    rows: list[tuple[str, bool, str]],
+    directory: Path,
+) -> None:
+    replace_criterion_grades(
+        "fake-run",
+        task_id,
+        attempt,
+        judge,
+        rubric_id="demo",
+        rubric_version=1,
+        rubric_hash="hash",
+        marks=[
+            CriterionMark(criterion_id=criterion_id, met=met, reason=reason)
+            for criterion_id, met, reason in rows
+        ],
+        directory=directory,
+    )
+
+
+def _attempt_blocks(text: str) -> dict[int, str]:
+    matches = list(re.finditer(r"^attempt (\d+)$", text, re.MULTILINE))
+    blocks: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        blocks[int(match.group(1))] = text[match.end() : end]
+    return blocks
+
+
+def _grade_rows(block: str, judge: str) -> list[tuple[str, str, str]]:
+    body = block.split(f"judge: {judge}", 1)[1].split("\njudge: ", 1)[0]
+    lines = [line for line in body.splitlines() if line.strip()]
+    assert lines[0].split()[:3] == ["criterion_id", "met", "reason"]
+    rows: list[tuple[str, str, str]] = []
+    for line in lines[1:]:
+        criterion_id, met, reason = line.split(None, 2)
+        rows.append((criterion_id, met, reason))
+    return rows
 
 
 def test_config_loads_and_cli_flags_override(

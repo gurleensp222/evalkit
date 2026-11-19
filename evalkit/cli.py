@@ -25,6 +25,7 @@ from evalkit.storage import (
     DEFAULT_RUNS_DIR,
     SQLITE_DATASET,
     StoredCriterionGrade,
+    list_judges,
     load_criterion_grades,
     load_latest_rubrics,
     load_results,
@@ -337,7 +338,7 @@ def report(run_id: str) -> None:
 
 @app.command()
 def show(run_id: str, task_id: str) -> None:
-    """Print every attempt's raw output, score, and reason for one task."""
+    """Print every attempt's output, then each judge's criterion grades."""
     try:
         results = load_results(run_id)
     except FileNotFoundError:
@@ -350,12 +351,26 @@ def show(run_id: str, task_id: str) -> None:
     if not matched:
         typer.echo(f"no task named {task_id} in run {run_id}", err=True)
         raise typer.Exit(1)
+    grades_by_judge = {
+        judge: load_criterion_grades(run_id, judge=judge) for judge in list_judges(run_id)
+    }
     for result in matched:
         typer.echo(f"attempt {result.attempt}")
         typer.echo(f"score: {result.score:.2f}")
         typer.echo(f"reason: {result.reason}")
         typer.echo("output:")
         typer.echo(result.output)
+        for judge, grades in grades_by_judge.items():
+            rows = [
+                grade
+                for grade in grades
+                if grade.task_id == result.task_id and grade.attempt == result.attempt
+            ]
+            if not rows:
+                continue
+            typer.echo("")
+            typer.echo(f"judge: {judge}")
+            typer.echo(_grade_table(rows))
         typer.echo("")
 
 
@@ -467,6 +482,22 @@ def _print_criteria(run_id: str, results: list[TaskResult]) -> None:
         typer.echo(
             f"{result.task_id}  attempt {result.attempt}  {result.model}  {result.failure_type}"
         )
+
+
+def _grade_table(grades: list[StoredCriterionGrade]) -> str:
+    """One row per criterion: id, yes or no, and the judge's reason."""
+    frame = pd.DataFrame(
+        [
+            {
+                "criterion_id": grade.criterion_id,
+                "met": "yes" if grade.met else "no",
+                "reason": grade.reason,
+            }
+            for grade in grades
+        ]
+    )
+    with pd.option_context("display.max_colwidth", None, "display.max_rows", None):
+        return frame.to_string(index=False, line_width=1_000_000)
 
 
 def _criterion_table(results: list[TaskResult], grades: list[StoredCriterionGrade]) -> str:

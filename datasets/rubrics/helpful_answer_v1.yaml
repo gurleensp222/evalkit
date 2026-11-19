@@ -14,9 +14,9 @@ criteria:
     necessity: implicit
     kind: subjective
     critical: true
-    description: The reply states no policy details beyond those given in the prompt.
-    example: It does not promise a delivery date or mention a fee that was never given.
-    answer_key: Fails if the reply adds a policy detail the customer did not state.
+    description: The reply states no policy, service, or capability beyond what the prompt gives, and does not claim to take actions on the customer's behalf.
+    example: It does not offer to expedite, reroute, switch carriers, waive fees, or give compensation unless the prompt says these exist, and it does not say "I'll check and get back to you".
+    answer_key: Fails if the reply offers any option, action, or policy detail that the prompt did not state.
   - id: actionable_next_step
     weight: 0.2
     necessity: implicit

@@ -10,7 +10,7 @@ from evalkit.providers import ProviderError
 from evalkit.storage import load_results, upsert_run
 
 TASKS = """\
-{"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "4"}
+{"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "I don't know"}
 {"id": "capital-of-france", "category": "knowledge", "prompt": "capital", "scorer": "exact_match", "expected": "Paris"}
 """
 
@@ -85,7 +85,7 @@ def test_mock_run_summary_and_failures(client: TestClient, dataset: Path) -> Non
         "capital-of-france",
     ]
     assert reasons[0]["category"] == "knowledge"
-    assert reasons[0]["failure_type"] == "wrong answer"
+    assert reasons[0]["failure_type"] == "refusal"
     assert "Paris" in reasons[0]["reason"]
 
 
@@ -441,7 +441,7 @@ def test_run_can_use_prompts_stored_in_sqlite(client: TestClient) -> None:
             "category": "math",
             "prompt": "2+2",
             "scorer": "exact_match",
-            "expected": "4",
+            "expected": "I don't know",
         },
     )
     created = client.post("/runs", json={"provider": "mock", "dataset": "sqlite", "attempts": 1})

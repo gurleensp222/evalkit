@@ -35,9 +35,9 @@ from evalkit.storage import (
 app = typer.Typer(help="Run model evaluations and report the scores.", no_args_is_help=True)
 
 DATASET_OPTION = typer.Option(
-    Path("datasets/sample_tasks.jsonl"),
+    Path("datasets/prompts"),
     "--dataset",
-    help="JSONL file of tasks.",
+    help="JSONL file or directory of prompts.",
 )
 PROVIDER_OPTION = typer.Option(
     None,
@@ -93,7 +93,7 @@ STRICT_OPTION = typer.Option(
 )
 DEFAULT_RUBRICS = Path("datasets/rubrics")
 ANSWER_DATASET_OPTION = typer.Option(
-    Path("datasets/sample_tasks.jsonl"),
+    Path("datasets/prompts"),
     "--dataset",
     help="JSONL file or directory of prompts.",
 )

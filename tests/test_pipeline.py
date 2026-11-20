@@ -11,7 +11,7 @@ from evalkit.runner import run_eval
 from evalkit.storage import answer_keys, load_answers, load_results, load_run
 
 TASKS = """\
-{"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "4"}
+{"id": "two-plus-two", "category": "math", "prompt": "2+2", "scorer": "exact_match", "expected": "I don't know"}
 {"id": "capital-of-france", "category": "knowledge", "prompt": "capital", "scorer": "exact_match", "expected": "Paris"}
 """
 

@@ -40,7 +40,7 @@ from evalkit.storage import (
     upsert_run,
 )
 
-DEFAULT_DATASET = Path("datasets/sample_tasks.jsonl")
+DEFAULT_DATASET = Path("datasets/prompts")
 DEFAULT_RUBRICS = Path("datasets/rubrics")
 RunStatusName = Literal[
     "answering",
@@ -74,7 +74,7 @@ class RunCreate(BaseModel):
 
     provider: str = Field(examples=["mock"], description="mock, ollama, openai, or anthropic.")
     dataset: str = Field(
-        examples=["datasets/sample_tasks.jsonl"],
+        examples=["datasets/prompts"],
         description="Path to a JSONL task file, or 'sqlite' for prompts stored by POST /prompts.",
     )
     model: str | None = Field(

@@ -98,7 +98,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        default="datasets/sample_tasks.jsonl",
+        default="datasets/prompts",
         help="JSONL file of tasks. Both models see this file.",
     )
     parser.add_argument("--a", default="openai", help="First provider.")

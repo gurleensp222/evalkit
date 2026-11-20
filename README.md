@@ -4,37 +4,13 @@ A two-pass evaluation harness for language models. One model answers a set of pr
 
 [![CI](https://github.com/gurleensp222/evalkit/actions/workflows/ci.yml/badge.svg)](https://github.com/gurleensp222/evalkit/actions/workflows/ci.yml)
 
-## Results
-
-> These numbers come from the **mock provider**, which returns canned answers. They show the pipeline working end to end, not how a real model performs. Real model results are next on the roadmap.
-
-`evalkit run --provider mock` on `datasets/sample_tasks.jsonl`, with 3 attempts per task: 8 tasks, 24 attempts, 12 passed attempts, and 4 tasks passing all attempts (pass rate 0.50).
-
-| Category | Passed | Pass rate |
-| --- | --- | --- |
-| math | 1/1 | 1.00 |
-| code | 1/2 | 0.50 |
-| format | 1/2 | 0.50 |
-| knowledge | 1/3 | 0.33 |
-
-| Task | Category | Result | Failure type | Reason |
-| --- | --- | --- | --- | --- |
-| two-plus-two | math | pass | | exact match |
-| add-function | code | pass | | all asserts passed |
-| add-function-arguments | code | fail | wrong answer | assertion failed |
-| name-and-city | format | pass | | valid JSON with required keys |
-| keys-a-and-b | format | fail | format error | missing key `b` |
-| primary-colors | knowledge | pass | | all expected strings found |
-| closest-planets | knowledge | fail | wrong answer | missing mercury, venus, earth |
-| capital-of-france | knowledge | fail | wrong answer | expected Paris, got Lyon |
-
 ## Quick start
 
 ### Local, no Docker
 
 ```bash
 python -m pip install -e ".[dev]"
-evalkit run --provider mock
+evalkit run --dataset datasets/prompts --provider ollama --model llama3.2
 evalkit report <run_id>
 evalkit show <run_id> <task_id>
 ```
@@ -94,7 +70,6 @@ Built-in scorers live on the task. A judge rubric lives in its own file, and the
 
 ```text
 datasets/
-  sample_tasks.jsonl          # scorer tasks
   prompts/
     support.jsonl             # rubric_id: helpful_answer_v1
     coding_help.jsonl         # rubric_id: code_explanation_v1
@@ -188,7 +163,7 @@ The linter warns when a criterion seems to hold two requirements, refers to info
 
 **Met or not met, per criterion.** Small yes-or-no checks are easier for a grader to apply consistently than a 1 to 5 scale, and they show where a model is weak (for example, "accurate but asks for a card number") instead of giving a single number.
 
-**Mock provider.** Tests, CI, and the sample dataset use canned answers keyed by task id. Those runs are deterministic and need no API key or network.
+**Mock provider.** Tests can pass a dict of answers keyed by task id. With no dict, every prompt gets "I don't know". Those runs need no API key or network.
 
 **Subprocess for code.** `python_unit_tests` writes the extracted program to a temporary directory and runs it with the current Python. The shell is disabled, stdin is closed, and there is a five-second timeout. A failing assert, an exception, or a hang becomes a failed score instead of crashing the runner.
 
@@ -201,11 +176,11 @@ pytest                 # live Ollama tests are skipped by default
 pytest -m ollama       # needs a running Ollama
 ```
 
-On every push and pull request, CI runs Ruff, runs pytest with a coverage floor of 80%, runs `evalkit rubrics lint --strict`, runs a mock smoke eval that fails if the pass rate drops below 0.50, and builds the Docker image.
+On every push and pull request, CI runs Ruff, runs pytest with a coverage floor of 80%, runs `evalkit rubrics lint --strict`, and builds the Docker image.
 
 ## Known limitations and next steps
 
 - **Code execution is not sandboxed.** `python_unit_tests` runs as the same user as evalkit, with network and filesystem access. Only run tasks you trust, and keep the API private. A locked-down container is the next step.
 - **Judge bias.** The judge is told not to reward length, but it may still prefer a familiar style. Next is grader calibration: hand-grade about 30 answers, then report agreement and Cohen's kappa per criterion, and run a length-bias check that pads answers with filler.
 - **Hosted model names.** OpenAI and Anthropic runs are saved as `openai` and `anthropic`, not by model id. To compare two models from the same provider, use `scripts/compare_models.py` with `--model-a` and `--model-b`.
-- **Small dataset.** Eight scorer tasks and ten rubric prompts give a coarse interval. A larger, realistic prompt set (false premises, hallucination bait, over-refusal, implicit constraints) is next, followed by real results from two Ollama models and a third grader.
+- **Small dataset.** Ten rubric prompts give a coarse interval. A larger, realistic prompt set (false premises, hallucination bait, over-refusal, implicit constraints) is next, followed by real results from two Ollama models and a third grader.

@@ -1,7 +1,7 @@
 """Model providers.
 
 ``generate(prompt)`` returns the completion text. ``task_id`` is optional and is
-how ``MockProvider`` looks up a canned answer.
+how ``MockProvider`` looks up an answer supplied by the caller.
 """
 
 from __future__ import annotations
@@ -10,17 +10,6 @@ import os
 from typing import Any, Protocol
 
 import httpx
-
-MOCK_ANSWERS: dict[str, str] = {
-    "two-plus-two": "4",
-    "capital-of-france": "Lyon",
-    "primary-colors": "The primary colors are red, blue, and yellow.",
-    "closest-planets": "Mars and Jupiter are planets.",
-    "name-and-city": '{"name": "Ada", "city": "London"}',
-    "keys-a-and-b": '{"a": 1}',
-    "add-function": "def add(a, b):\n    return a + b\n",
-    "add-function-arguments": "def add(a, b):\n    return a - b\n",
-}
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 OLLAMA_URL = DEFAULT_OLLAMA_URL
@@ -51,7 +40,10 @@ class Provider(Protocol):
 
 
 class MockProvider:
-    """Return canned answers from a dict keyed by task id."""
+    """Return answers from a dict keyed by task id.
+
+    With no dict, every prompt gets ``I don't know``.
+    """
 
     def __init__(
         self,
@@ -60,8 +52,7 @@ class MockProvider:
         name: str = "mock",
     ) -> None:
         self.name = name
-        source = MOCK_ANSWERS if answers is None else answers
-        self.answers = dict(source)
+        self.answers = dict(answers or {})
 
     def generate(
         self,

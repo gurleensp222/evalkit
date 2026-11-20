@@ -22,7 +22,6 @@ from evalkit.providers import (
 from evalkit.runner import MAX_WORKERS, load_tasks, run_eval
 from evalkit.storage import load_results, save_results
 
-DATASET = Path(__file__).resolve().parents[1] / "datasets" / "sample_tasks.jsonl"
 CLI = CliRunner()
 
 
@@ -34,40 +33,6 @@ def _task(task_id: str, scorer: str = "exact_match", expected: object = "4") -> 
         scorer=scorer,
         expected=expected,
     )
-
-
-def test_run_eval_scores_right_and_wrong_canned_answers() -> None:
-    tasks = [
-        _task("two-plus-two"),
-        _task("capital-of-france", expected="Paris"),
-        _task("missing-id"),
-    ]
-    results = run_eval(tasks, MockProvider(), "run-scores", repeats=1)
-
-    assert [result.task_id for result in results] == [
-        "two-plus-two",
-        "capital-of-france",
-        "missing-id",
-    ]
-    assert results[0].passed is True
-    assert results[0].score == 1.0
-    assert results[0].output == "4"
-    assert results[1].passed is False
-    assert results[1].output == "Lyon"
-    assert results[2].passed is False
-    assert results[2].output == "I don't know"
-    assert {result.run_id for result in results} == {"run-scores"}
-    assert {result.model for result in results} == {"mock"}
-    assert all(result.latency_ms >= 0 for result in results)
-
-
-def test_run_eval_loads_the_sample_dataset() -> None:
-    results = run_eval(DATASET, MockProvider(), "sample")
-    passed = {result.task_id for result in results if result.passed}
-    failed = {result.task_id for result in results if not result.passed}
-
-    assert passed == {"two-plus-two", "primary-colors", "name-and-city", "add-function"}
-    assert failed == {"capital-of-france", "closest-planets", "keys-a-and-b", "add-function-arguments"}
 
 
 def test_load_tasks_skips_blank_lines(tmp_path: Path) -> None:
@@ -220,7 +185,7 @@ def test_run_eval_records_a_missing_judge() -> None:
 def test_run_eval_reports_an_unknown_scorer() -> None:
     results = run_eval(
         [_task("two-plus-two", scorer="not-a-scorer")],
-        MockProvider(),
+        MockProvider({"two-plus-two": "4"}),
         "bad-scorer",
         repeats=1,
     )
@@ -250,7 +215,12 @@ def test_run_eval_flags_answers_that_change_across_attempts() -> None:
 
 
 def test_run_eval_keeps_stable_answers_unflagged() -> None:
-    results = run_eval([_task("two-plus-two")], MockProvider(), "stable", repeats=3)
+    results = run_eval(
+        [_task("two-plus-two")],
+        MockProvider({"two-plus-two": "4"}),
+        "stable",
+        repeats=3,
+    )
     assert len(results) == 3
     assert all(result.passed for result in results)
     assert all(not result.unstable for result in results)
@@ -596,19 +566,25 @@ def test_create_provider_passes_a_model_id(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_cli_run_and_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text(
+        '{"id": "sum", "category": "math", "prompt": "2+2", '
+        '"scorer": "exact_match", "expected": "I don\'t know"}\n',
+        encoding="utf-8",
+    )
     completed = CLI.invoke(
         app,
-        ["run", "--dataset", str(DATASET), "--provider", "mock", "--run-id", "cli-run"],
+        ["run", "--dataset", str(dataset), "--provider", "mock", "--attempts", "1", "--run-id", "cli-run"],
     )
     assert completed.exit_code == 0
     assert "run_id: cli-run" in completed.stdout
-    assert "tasks: 8  attempts: 24  passed attempts: 12  tasks passing all attempts: 4" in completed.stdout
+    assert "tasks: 1  attempts: 1  passed attempts: 1  tasks passing all attempts: 1" in completed.stdout
     assert (tmp_path / "runs" / "evalkit.db").is_file()
 
     reported = CLI.invoke(app, ["report", "cli-run"])
     assert reported.exit_code == 0
     assert "run_id: cli-run" in reported.stdout
-    assert "add-function-arguments" in reported.stdout
+    assert "sum" in reported.stdout
     header = next(
         line
         for line in reported.stdout.splitlines()
@@ -617,12 +593,11 @@ def test_cli_run_and_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert "flags" in header.split()
     assert "failure" in header.split()
 
-    shown = CLI.invoke(app, ["show", "cli-run", "two-plus-two"])
+    shown = CLI.invoke(app, ["show", "cli-run", "sum"])
     assert shown.exit_code == 0
     assert "attempt 1" in shown.stdout
-    assert "attempt 3" in shown.stdout
     assert "score: 1.00" in shown.stdout
-    assert "output:\n4" in shown.stdout
+    assert "output:\nI don't know" in shown.stdout
 
     missing = CLI.invoke(app, ["show", "cli-run", "not-a-task"])
     assert missing.exit_code == 1
@@ -677,6 +652,8 @@ def test_cli_forwards_model_temperature_and_workers(
         return []
 
     monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr("evalkit.cli.create_provider", create)
     monkeypatch.setattr("evalkit.cli.answer_run", answer_run)
     monkeypatch.setattr("evalkit.cli.grade_run", grade_run)
@@ -685,7 +662,7 @@ def test_cli_forwards_model_temperature_and_workers(
         [
             "run",
             "--dataset",
-            str(DATASET),
+            str(dataset),
             "--provider",
             "ollama",
             "--model",
@@ -712,7 +689,7 @@ def test_cli_forwards_model_temperature_and_workers(
         [
             "run",
             "--dataset",
-            str(DATASET),
+            str(dataset),
             "--provider",
             "mock",
             "--attempts",
@@ -726,7 +703,7 @@ def test_cli_forwards_model_temperature_and_workers(
 
     rejected = CLI.invoke(
         app,
-        ["run", "--dataset", str(DATASET), "--provider", "mock", "--attempts", "0"],
+        ["run", "--dataset", str(dataset), "--provider", "mock", "--attempts", "0"],
     )
     assert rejected.exit_code != 0
 
@@ -757,10 +734,16 @@ def test_cli_stops_when_the_ollama_model_is_missing(
             return FakeResponse()
 
     monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text(
+        '{"id": "sum", "category": "math", "prompt": "2+2", '
+        '"scorer": "exact_match", "expected": "4"}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(httpx, "Client", FakeClient)
     completed = CLI.invoke(
         app,
-        ["run", "--dataset", str(DATASET), "--provider", "ollama", "--run-id", "missing-model"],
+        ["run", "--dataset", str(dataset), "--provider", "ollama", "--run-id", "missing-model"],
     )
     assert completed.exit_code == 1
     assert "run: ollama pull llama3.2" in completed.stdout + completed.stderr

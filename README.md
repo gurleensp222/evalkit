@@ -1,12 +1,14 @@
 # evalkit
 
-Score model outputs on a JSONL task set, save the run, and compare pass rates.
+A two-pass evaluation harness for language models. One model answers a set of prompts. Built-in scorers or a separate grader model then score each saved answer against versioned, weighted rubrics. Everything is stored in SQLite, so you can re-grade the same answers with a new rubric or a different judge without calling the answer model again.
 
 [![CI](https://github.com/gurleensp222/evalkit/actions/workflows/ci.yml/badge.svg)](https://github.com/gurleensp222/evalkit/actions/workflows/ci.yml)
 
 ## Results
 
-Local mock run of `datasets/sample_tasks.jsonl` (run `4824ed0c60ef432486202289b9900a7a`). Four of eight tasks passed. Pass rate 0.50, mean score 0.50.
+> These numbers come from the **mock provider**, which returns canned answers. They show the pipeline working end to end, not how a real model performs. Real model results are next on the roadmap.
+
+`evalkit run --provider mock` on `datasets/sample_tasks.jsonl`, with 3 attempts per task: 8 tasks, 24 attempts, 12 passed attempts, and 4 tasks passing all attempts (pass rate 0.50).
 
 | Category | Passed | Pass rate |
 | --- | --- | --- |
@@ -15,40 +17,20 @@ Local mock run of `datasets/sample_tasks.jsonl` (run `4824ed0c60ef432486202289b9
 | format | 1/2 | 0.50 |
 | knowledge | 1/3 | 0.33 |
 
-| Task | Category | Result | Reason |
-| --- | --- | --- | --- |
-| two-plus-two | math | pass | exact match |
-| add-function | code | pass | all asserts passed |
-| add-function-arguments | code | fail | assertion failed |
-| name-and-city | format | pass | valid JSON with required keys |
-| keys-a-and-b | format | fail | missing key `b` |
-| primary-colors | knowledge | pass | all expected strings found |
-| closest-planets | knowledge | fail | missing mercury, venus, earth |
-| capital-of-france | knowledge | fail | expected Paris, got Lyon |
-
-A second mock run of the same file (`0c905dadf98844598c0ad95e53fdf18f`) matched task for task. `compare()` reported a difference of 0.00 with interval [0.00, 0.00].
+| Task | Category | Result | Failure type | Reason |
+| --- | --- | --- | --- | --- |
+| two-plus-two | math | pass | | exact match |
+| add-function | code | pass | | all asserts passed |
+| add-function-arguments | code | fail | wrong answer | assertion failed |
+| name-and-city | format | pass | | valid JSON with required keys |
+| keys-a-and-b | format | fail | format error | missing key `b` |
+| primary-colors | knowledge | pass | | all expected strings found |
+| closest-planets | knowledge | fail | wrong answer | missing mercury, venus, earth |
+| capital-of-france | knowledge | fail | wrong answer | expected Paris, got Lyon |
 
 ## Quick start
 
-Create an empty `.env` in the project directory. Compose reads that file on startup. Put `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` there when you call a live model.
-
-```bash
-docker compose up --build
-docker compose exec ollama ollama pull llama3.2
-```
-
-The API listens on http://localhost:8000. Interactive docs are at http://localhost:8000/docs, and saved runs are written to `./runs`. Compose also starts an `ollama` service and sets `OLLAMA_URL=http://ollama:11434` on the API. Model files stay in the `ollama_models` volume.
-
-When Ollama is already running on the host, delete the compose `ollama` service and the API `depends_on` block, and point the API at the host instead:
-
-```yaml
-environment:
-  OLLAMA_URL: http://host.docker.internal:11434
-```
-
-`host.docker.internal` is the machine running Docker Desktop. The API container then uses the models you already pulled on the host.
-
-For a local mock run without Docker:
+### Local, no Docker
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -57,20 +39,58 @@ evalkit report <run_id>
 evalkit show <run_id> <task_id>
 ```
 
-An Ollama run records the model id, not the word `ollama`:
+Runs are saved to `runs/evalkit.db`.
+
+### With Ollama
 
 ```bash
 evalkit run --provider ollama --model llama3.2 --temperature 0.2
 evalkit run --config agents.example.yaml
 ```
 
-`agents.example.yaml` sets the answer model to Ollama `llama3.2` at temperature 0.7 and the grader to `qwen2.5:3b` at temperature 0. A flag on the command replaces the matching value in the file.
+`agents.example.yaml` sets the answer model to Ollama `llama3.2` at temperature 0.7 and the grader to `qwen2.5:3b` at temperature 0. A command-line flag replaces the matching value in the file. Before a run starts, evalkit checks Ollama's `/api/tags`. If a model is missing, it stops with `run: ollama pull <model>`.
 
-`evalkit run` prints a run id, a pass count, and one line per task. CI runs this same command and fails if the sample pass rate drops below 0.50.
+### Docker
+
+Create an empty `.env` in the project directory. Put `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` there when you call a hosted model.
+
+```bash
+docker compose up --build
+docker compose exec ollama ollama pull llama3.2
+```
+
+The API listens on http://localhost:8000, with interactive docs at http://localhost:8000/docs. The database is written to `./runs`. Compose also starts an `ollama` service, sets `OLLAMA_URL=http://ollama:11434` on the API, and keeps model files in the `ollama_models` volume.
+
+If Ollama already runs on your computer, delete the compose `ollama` service and the API's `depends_on` block, and point the API at the host:
+
+```yaml
+environment:
+  OLLAMA_URL: http://host.docker.internal:11434
+extra_hosts:
+  - "host.docker.internal:host-gateway"   # needed on Linux
+```
+
+> **Security:** the API has no authentication, and a task that uses `python_unit_tests` runs code on the server. Run the API only on your own machine or a trusted network, and do not expose port 8000 or 11434 to the internet.
+
+## Two passes: answer, then grade
+
+```bash
+evalkit answer --dataset datasets/prompts --provider ollama --model llama3.2
+evalkit grade <run_id> --judge-provider ollama --judge-model qwen2.5:3b
+evalkit report <run_id>
+```
+
+- **Answer pass.** Each prompt is answered `--attempts` times (default 3), and every answer is committed as soon as it finishes. `evalkit answer --resume <run_id>` continues an interrupted run and skips answers that are already saved.
+- **Grade pass.** Saved answers are scored by their scorer or rubric. Grading the same run with another judge stores those grades next to the first judge's, so judges can be compared.
+- **`evalkit run`** does both passes in one command.
+
+`--grader-context response_only` sends the grader only the response and the rubric. `with_prompt` (the default) also sends the task. Running both on the same answers shows how much the grader relies on seeing the prompt.
+
+When a task's attempts disagree on pass or fail, it is flagged `unstable`. When the answer text differs between attempts, it is flagged `output_varies`.
 
 ## Prompts and rubrics
 
-Built-in scorers live on the task. A judge rubric lives in its own file, and the prompt only names that file's id. A task sets `scorer` or `rubric_id`, not both.
+Built-in scorers live on the task. A judge rubric lives in its own file, and the prompt only names that file's id. A task sets either `scorer` or `rubric_id`, not both.
 
 ```text
 datasets/
@@ -83,7 +103,13 @@ datasets/
     code_explanation_v1.yaml
 ```
 
-A rubric file's name is its id. Weights sum to 1. An objective criterion needs an `answer_key`. A subjective criterion needs an `example`. `evalkit rubrics validate` checks the folder before a run. `evalkit rubrics lint` prints warnings and exits 0. `evalkit rubrics lint --strict` exits 1 when it finds any.
+A rubric file's name is its id, and its weights sum to 1. Each criterion is:
+
+- `explicit` (stated in the prompt) or `implicit` (a good answer needs it anyway),
+- `objective`, which needs an `answer_key`, or `subjective`, which needs an `example`,
+- optionally `critical: true`. A failed critical criterion fails the answer, whatever its weighted score.
+
+The grader marks each criterion met or not met, with a one-line reason. The score is the sum of the weights of the met criteria, and the answer passes when that score reaches `pass_threshold` and no critical criterion failed. Every saved grade stores the rubric id, version, and content hash.
 
 ```yaml
 id: helpful_answer_v1
@@ -97,26 +123,6 @@ criteria:
     kind: subjective
     description: The reply directly answers the customer's question.
     example: For a refund question, the reply states the refund window.
-  - id: no_invented_policy
-    weight: 0.25
-    necessity: implicit
-    kind: subjective
-    critical: true
-    description: The reply states no policy details beyond those given in the prompt.
-    example: It does not promise a delivery date or mention a fee that was never given.
-    answer_key: Fails if the reply adds a policy detail the customer did not state.
-  - id: actionable_next_step
-    weight: 0.2
-    necessity: implicit
-    kind: subjective
-    description: The reply gives the customer one concrete next step.
-    example: Check the order page, or reply with the order number.
-  - id: plain_language
-    weight: 0.15
-    necessity: implicit
-    kind: subjective
-    description: The reply uses plain language without jargon.
-    example: It says "refund" rather than "chargeback reversal".
   - id: no_sensitive_data_request
     weight: 0.1
     necessity: implicit
@@ -124,50 +130,82 @@ criteria:
     critical: true
     description: The reply never asks for a password or a full card number.
     answer_key: Fails if the reply requests a password, full card number, or card security code.
+  # ...
 ```
 
 ```json
 {"id": "refund-window", "category": "support", "prompt": "A customer asks how long they have to request a refund. The policy is 30 days from delivery. Reply in two sentences.", "rubric_id": "helpful_answer_v1"}
 ```
 
-A prompt can add `extra_criteria` using the same criterion fields. The rubric criteria keep their relative weights, the extra criteria use the weights written on the prompt, and then every weight is scaled so the set sums to 1. A criterion id that already appears on the rubric is rejected. The grade stores a hash of that merged rubric. `evalkit rubrics lint` also warns on `extra_criteria` in `datasets/prompts`.
+**Per-prompt criteria.** A prompt can add `extra_criteria`, using the same fields. The rubric criteria keep their relative weights, the extra criteria use the weights written on the prompt, and then every weight is rescaled so the set sums to 1. A criterion id that already appears on the rubric is rejected. The grade stores a hash of the merged rubric.
 
-`no_fabricated_links` fails when the answer contains an `http` or `https` URL that is not in the task's `allowed_urls` list. An empty list allows no links. A rubric task can set `deterministic_checks` to `["no_fabricated_links"]`. A failed check is stored as `critical:no_fabricated_links` and the judge is not called for that attempt.
+**Deterministic checks.** `no_fabricated_links` fails when the answer contains an `http` or `https` URL that is not in the task's `allowed_urls`. An empty list allows no links. URLs are compared after lowercasing the scheme and host and dropping default ports, trailing slashes, and `#fragments`. A rubric task can list `deterministic_checks: ["no_fabricated_links"]`. A failed check is stored as `critical:no_fabricated_links`, and the judge is not called for that attempt.
+
+**Linting.**
 
 ```bash
 evalkit rubrics list
-evalkit rubrics lint --strict
-evalkit run --dataset datasets/prompts --provider ollama --judge-provider ollama --judge-model llama3.2
+evalkit rubrics validate        # schema errors, exits 1
+evalkit rubrics lint            # warnings, exits 0
+evalkit rubrics lint --strict   # exits 1 on any warning (CI runs this)
 ```
 
-The judge runs at temperature 0 and is asked for JSON. Each saved row stores the rubric id, version, and content hash.
+The linter warns when a criterion seems to hold two requirements, refers to information the grader cannot see without an `answer_key`, or is generic (spelling, politeness, "follows instructions"). It also warns when a rubric has no implicit criteria. The same rules are applied to `extra_criteria` in `datasets/prompts`.
+
+## HTTP API
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/health` | Liveness check |
+| GET | `/tasks` | List tasks in a dataset |
+| POST | `/rubrics` | Store a rubric as a new version, and return lint warnings |
+| GET | `/rubrics/{id}` | Latest version of a rubric |
+| GET | `/rubrics/{id}/versions` | Every version, oldest first |
+| POST | `/prompts` | Store a prompt. Its `rubric_id` must already exist |
+| GET | `/prompts` | List stored prompts |
+| POST | `/runs` | Start an answer and grade run in the background |
+| POST | `/runs/{id}/grade` | Re-grade saved answers, optionally with another judge |
+| GET | `/runs` | List runs and their status |
+| GET | `/runs/{id}` | Status, progress counts, summary, and pass rate by category |
+| GET | `/runs/{id}/failures` | Failed attempts and their reasons |
+| GET | `/runs/{id}/criteria` | How often each criterion was met, per model |
+| GET | `/compare?a=&b=` | Paired comparison of two graded runs |
+
+`POST /runs` accepts a file path as `dataset`, or `"sqlite"` to use prompts stored through `POST /prompts`. Rubrics stored through the API take priority over a file rubric with the same id.
 
 ## How it works
 
-Each line of a dataset is a task: an id, a category, a prompt, a scorer name, and the `expected` value that scorer checks. A provider turns the prompt into text. Built-in providers are `mock`, `ollama`, `openai`, and `anthropic`.
-
-The runner loads the file, calls the provider from a pool of four workers, retries a failed call, and applies a timeout to each attempt. One failed task is stored with score 0 and the run continues. The named scorer maps the output to a score from 0 to 1. Scorers are `exact_match`, `contains_all`, `json_valid`, `python_unit_tests`, `llm_judge`, and `no_fabricated_links`.
-
-Storage writes one JSON object per line to `runs/<run_id>.jsonl`. Analysis loads those files and reports pass rate, mean score, latency, a category-by-model table, the failures, and a paired comparison of two models.
+- **Providers:** `mock`, `ollama`, `openai`, and `anthropic`. Ollama uses `/api/chat`, reads `OLLAMA_URL`, and defaults to one worker and a 120 second timeout. The judge always runs at temperature 0 and is asked for JSON.
+- **Scorers:** `exact_match`, `contains_all`, `json_valid`, `python_unit_tests`, `llm_judge` (a single 1 to 5 score, where 3 or higher passes), and `no_fabricated_links`.
+- **Failures:** a failed provider call is retried. After the last retry, the attempt is stored with score 0 and the run continues. Each failure gets a type: `timeout`, `format error`, `refusal`, `wrong answer`, `grader_parse_error`, or `critical:<criterion>`.
+- **Storage:** SQLite at `runs/evalkit.db`, with tables for `runs`, `answers`, `results`, per-criterion `grades`, `stored_rubrics`, and `stored_prompts`.
+- **Analysis:** pandas reports pass rate, mean score, mean and p95 latency, a category-by-model table, failures, and per-criterion met rates.
+- **Dashboard:** `pip install -e ".[dashboard]"`, then `streamlit run scripts/dashboard.py`.
 
 ## Design decisions
 
-**Mock provider.** Tests, CI, and the sample dataset call canned answers keyed by task id. Those runs are deterministic and do not need an API key or a network. The sample file is written so four canned answers pass and four fail.
+**Two passes instead of one loop.** Answers are saved before grading. Re-grading with a new rubric or a different judge is cheap and repeatable, and on a laptop Ollama loads each model once instead of swapping between models on every prompt.
 
-**Subprocess for code.** `python_unit_tests` writes the extracted program to a temporary directory and runs it with the current Python, with the shell disabled, stdin closed, and a five-second timeout. A failing assert, a raised exception, or a hang becomes a failed score instead of taking down the runner.
+**Met or not met, per criterion.** Small yes-or-no checks are easier for a grader to apply consistently than a 1 to 5 scale, and they show where a model is weak (for example, "accurate but asks for a card number") instead of giving a single number.
 
-**Bootstrap intervals.** `compare()` pairs tasks both models answered, takes the difference in pass rate, and resamples those tasks with replacement 1000 times from a fixed seed. The reported interval is the middle 95% of those differences. A gap that still excludes zero is unlikely to be an accident of which tasks were in the set.
+**Mock provider.** Tests, CI, and the sample dataset use canned answers keyed by task id. Those runs are deterministic and need no API key or network.
+
+**Subprocess for code.** `python_unit_tests` writes the extracted program to a temporary directory and runs it with the current Python. The shell is disabled, stdin is closed, and there is a five-second timeout. A failing assert, an exception, or a hang becomes a failed score instead of crashing the runner.
+
+**Bootstrap intervals.** `compare()` pairs the tasks both models answered, takes the difference in pass rate, and resamples those tasks with replacement 1000 times from a fixed seed. The reported interval is the middle 95% of those differences. A gap that still excludes zero is unlikely to come from which tasks happened to be in the set.
+
+## Testing and CI
+
+```bash
+pytest                 # live Ollama tests are skipped by default
+pytest -m ollama       # needs a running Ollama
+```
+
+On every push and pull request, CI runs Ruff, runs pytest with a coverage floor of 80%, runs `evalkit rubrics lint --strict`, runs a mock smoke eval that fails if the pass rate drops below 0.50, and builds the Docker image.
 
 ## Known limitations and next steps
 
-The code scorer is a separate process with a timeout. It still runs as the same user, with a normal Python install, so it is the wrong place to run untrusted model output that should be denied network or filesystem access. A container with those limits removed would be the next boundary.
-
-`llm_judge` sends the prompt, the answer, and a rubric to a judge model and tells it not to reward length. The judge can still prefer a familiar style. A raw score of 3, 4, or 5 passes. Pass `--judge-provider`, or use `evalkit run --config agents.example.yaml`, when a task needs a judge.
-
-The table above is the mock provider, not two live models. With API keys set:
-
-```bash
-python scripts/compare_models.py --a openai --b anthropic
-```
-
-Eight binary tasks make a coarse interval. Two identical runs collapse it to a point. A larger task set is what would make the interval informative. The same provider used twice also needs `--model-a` and `--model-b`, or both runs are stored under one model name and `compare()` cannot pair them.
+- **Code execution is not sandboxed.** `python_unit_tests` runs as the same user as evalkit, with network and filesystem access. Only run tasks you trust, and keep the API private. A locked-down container is the next step.
+- **Judge bias.** The judge is told not to reward length, but it may still prefer a familiar style. Next is grader calibration: hand-grade about 30 answers, then report agreement and Cohen's kappa per criterion, and run a length-bias check that pads answers with filler.
+- **Hosted model names.** OpenAI and Anthropic runs are saved as `openai` and `anthropic`, not by model id. To compare two models from the same provider, use `scripts/compare_models.py` with `--model-a` and `--model-b`.
+- **Small dataset.** Eight scorer tasks and ten rubric prompts give a coarse interval. A larger, realistic prompt set (false premises, hallucination bait, over-refusal, implicit constraints) is next, followed by real results from two Ollama models and a third grader.

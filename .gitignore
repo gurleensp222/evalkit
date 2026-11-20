@@ -75,3 +75,5 @@ dmypy.json
 
 # Project
 runs/
+
+.DS_Store
